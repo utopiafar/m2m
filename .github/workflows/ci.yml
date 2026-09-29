@@ -24,11 +24,12 @@ jobs:
       - name: Test
         run: swift test
 
+      # 四进程隔离场景矩阵。已在本地与 CI 稳定通过，因此不再允许失败通过，
+      # 让 CI 真正为"重连不重放、弱网不丢字、降级有提示"这些性质把关。
       - name: Multi-process scenario matrix
         run: |
           .build/debug/m2mctl scenarios
           .build/debug/m2mctl selftest --report docs/reports/automated-test-report.md
-        continue-on-error: true
 
       - name: Upload test report
         if: always()
