@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build -v
+
+      # 单元与集成测试不需要屏幕录制 / 辅助功能权限：
+      # 平台调用全部封装在薄适配层之后，测试走合成实现，
+      # 因此可在无 GUI 的 CI 环境完整验证协议、状态机与调度语义。
+      - name: Test
+        run: swift test
+
+      - name: Multi-process scenario matrix
+        run: |
+          .build/debug/m2mctl scenarios
+          .build/debug/m2mctl selftest --report docs/reports/automated-test-report.md
+        continue-on-error: true
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: automated-test-report
+          path: docs/reports/
+          if-no-files-found: ignore

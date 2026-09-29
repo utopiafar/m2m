@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.o
+*.a
+*.swiftmodule
+.DS_Store
