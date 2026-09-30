@@ -135,12 +135,24 @@ public final class AXTextContextProvider: TextContextProvider {
         let before = String(chars[max(0, loc - 64)..<loc])
         let after = String(chars[loc..<min(chars.count, loc + 64)])
 
-        // 窗口归属：用于 Viewer 把文字与窗口对上
-        var windowUID = "ax:\(targetPID):unknown"
+        // 窗口归属：用于 Viewer 把文字与窗口对上。
+        // 必须与 AXWindowProvider 使用同一套身份格式，否则编辑器认不出这个窗口，
+        // 输入就会因为"没有目标窗口"被拒绝。
+        // 窗口归属必须与窗口枚举使用同一身份（CG 窗口号），
+        // 否则 Viewer 认不出这个窗口，输入会因"没有目标窗口"被拒绝。
+        var windowUID = "cg:\(targetPID):0"
         if let window = attribute(element, kAXWindowAttribute as String),
            CFGetTypeID(window) == AXUIElementGetTypeID() {
-            let title = string(window as! AXUIElement, kAXTitleAttribute as String) ?? ""
-            windowUID = "ax:\(targetPID):\(title.hashValue)"
+            let el = window as! AXUIElement
+            let title = string(el, kAXTitleAttribute as String) ?? ""
+            let size = sizeAttributeForIdentity(el) ?? (0, 0)
+            windowUID = CGWindowCatalog.windows(forPID: targetPID, onScreenOnly: false)
+                .first(where: { entry in
+                    let dw = abs(Double(entry.bounds.width) - size.width)
+                    let dh = abs(Double(entry.bounds.height) - size.height)
+                    return dw < 40 && dh < 60 && (entry.title.isEmpty || title.isEmpty || entry.title == title)
+                })
+                .map { CGWindowCatalog.uid(pid: targetPID, windowNumber: $0.number) } ?? windowUID
         }
 
         lock.lock(); let version = editVersion; lock.unlock()
@@ -167,6 +179,15 @@ public final class AXTextContextProvider: TextContextProvider {
         case "AXComboBox": return .textField
         default: return .unknown
         }
+    }
+
+    private func sizeAttributeForIdentity(_ el: AXUIElement) -> (width: Double, height: Double)? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &v) == .success,
+              let value = v, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(value as! AXValue, .cgSize, &size) else { return nil }
+        return (Double(size.width), Double(size.height))
     }
 
     private func isAttributeSettable(_ element: AXUIElement, _ name: String) -> Bool {

@@ -90,10 +90,8 @@ public final class SCKWindowProvider: WindowProvider {
 
     private static func info(from w: SCWindow, index: Int, provider: SCKWindowProvider) -> WindowInfo {
         let frame = w.frame
-        // SCWindow 给出的是包含标题栏的窗口框；内容区按标题栏高度估算，
-        // 真实内容尺寸会在采集到首帧后由像素尺寸校正（见 HostRuntime 的流信息回填）。
-        let titleBar: Double = 28
-        let content = Size(max(1, frame.width), max(1, frame.height - titleBar))
+        // SCK 的 frame 与 AX 的 AXSize 语义一致（都是窗口框），尺寸语义见 AXWindowProvider
+        let content = Size(max(1, frame.width), max(1, frame.height))
         return WindowInfo(
             windowUID: "sck:\(provider.targetPID):\(w.windowID)",
             appPID: provider.targetPID,
@@ -140,6 +138,30 @@ public final class SCKWindowProvider: WindowProvider {
 
     /// 连续枚举失败次数。仅用于诊断与提示，不用于判定窗口消失。
     public private(set) var consecutiveEnumerationFailures = 0
+
+    /// 按 (标题, 尺寸) 匹配一个 SCWindow。
+    ///
+    /// 用几何与标题匹配而不是用 SCK 自己的 windowID：AX 侧拿不到 SCK 的 windowID，
+    /// 而两侧都拿得到标题与尺寸。尺寸容差考虑到标题栏估算带来的偏差。
+    public func matchWindow(title: String, size: Size) -> SCWindow? {
+        lock.lock(); let windows = cachedWindows; lock.unlock()
+        guard !windows.isEmpty else { return nil }
+        var best: (SCWindow, Double)?
+        for w in windows {
+            // SCK 的 frame 与 AX 的 AXSize 都是窗口框，可直接比较
+            let frame = w.frame
+            let dw = abs(frame.width - size.width)
+            let dh = abs(frame.height - size.height)
+            let distance = dw + dh
+            let titleMatches = (w.title ?? "").isEmpty || title.isEmpty || w.title == title
+            let penalty: Double = titleMatches ? 0 : 200
+            let total = distance + penalty
+            if best == nil || total < best!.1 { best = (w, total) }
+        }
+        // 容差：标题与尺寸都不能差太远，否则宁可失败也不要采错窗口
+        guard let (window, score) = best, score < 160 else { return nil }
+        return window
+    }
 
     /// 采集用的 SCWindow（HostRuntime 在建立流时取用）。
     public func captureWindow(for uid: String) -> SCWindow? {
@@ -207,5 +229,98 @@ public enum RealCaptureFactory {
             return Result(source: nil, reason: source.unavailableReason, windowFound: true)
         }
         return Result(source: source, reason: nil, windowFound: true)
+    }
+}
+
+// MARK: - 真实模式下的窗口提供者（AX 枚举 + SCK 采集）
+
+/// 真实模式的窗口提供者：**枚举与操作走 AX，采集走 SCK**。
+///
+/// 为什么必须统一：AX 给出的窗口身份用于注册表、尺寸请求与文本归属；
+/// SCK 只负责"把这个窗口的画面采下来"。如果枚举用 SCK 而改尺寸用 AX，
+/// 两套 UID 无法对应，尺寸请求会落到错误的窗口上（实测表现为改错窗口或改不动）。
+/// 这里用 (PID, 标题, 尺寸) 把两侧对应起来。
+public final class RealWindowProvider: WindowProvider {
+    public let ax: AXWindowProvider
+    public let sck: SCKWindowProvider
+
+    public private(set) var matchFailures: [String] = []
+    public private(set) var filteredDegenerateWindows = 0
+
+    /// 由采集到的真实像素尺寸校正过的内容尺寸（窗口 UID → 尺寸）。
+    ///
+    /// 为什么需要它：CG 的窗口框含标题栏，标题栏高度只能估算（不同 macOS 版本、
+    /// 不同窗口样式都不一样）。任何估算都会让"请求尺寸"与"读回尺寸"产生固定偏差，
+    /// 而**采集到的像素尺寸是事实**——用 `像素 / contentScale` 即真实内容尺寸。
+    /// 一旦拿到像素就以此为准，估算只在首帧之前使用。
+    private var measuredContentSizes: [String: Size] = [:]
+
+    public func setMeasuredContentSize(uid: String, size: Size) {
+        measuredContentSizes[uid] = size
+    }
+
+    public func measuredContentSize(for uid: String) -> Size? { measuredContentSizes[uid] }
+
+    /// 尺寸小于此阈值的窗口视为应用内部窗口（如 1 像素高的辅助窗口），
+    /// 不建立本地窗口壳，也不参与采集——给它们建壳只会在本地显示一个空窗口。
+    public static let minimumMeaningfulSize: Double = 20
+
+    public init(ax: AXWindowProvider, sck: SCKWindowProvider) {
+        self.ax = ax
+        self.sck = sck
+    }
+
+    public var appBundleID: String { ax.appBundleID }
+    public var appDisplayName: String { ax.appDisplayName }
+    public var available: Bool { ax.available }
+
+    public func currentWindows() -> [WindowInfo] {
+        ax.currentWindows().compactMap { w in
+            guard w.contentSize.width >= Self.minimumMeaningfulSize,
+                  w.contentSize.height >= Self.minimumMeaningfulSize else {
+                filteredDegenerateWindows += 1
+                return nil
+            }
+            // 有实测像素就用实测值，否则用 CG 框减去估算的标题栏高度
+            guard let measured = measuredContentSizes[w.windowUID] else { return w }
+            var updated = w
+            updated.contentRect = Rect(origin: w.contentRect.origin, size: measured)
+            return updated
+        }
+    }
+
+    public func applySize(_ uid: String, requested: Size) -> (actual: Size, constrainedBy: SizeConstraint) {
+        let result = ax.applySize(uid, requested: requested)
+        // 实测优先：AX 读回的窗口框尺寸含标题栏，与内容尺寸存在估算偏差；
+        // 如果该窗口已经有实测像素尺寸，以实测为准，避免"请求 450 却读回 421"这类假偏差。
+        if let measured = measuredContentSizes[uid] {
+            let constrained = abs(measured.width - requested.width) > 2
+                || abs(measured.height - requested.height) > 2
+            return (measured, constrained ? result.constrainedBy == .none ? .appMin : result.constrainedBy
+                                          : .none)
+        }
+        return result
+    }
+
+    public func perform(_ action: WindowActionKind, on uid: String) -> Bool {
+        ax.perform(action, on: uid)
+    }
+
+    public func activate(_ uid: String) -> Bool {
+        ax.activate(uid)
+    }
+
+    /// 为某个 AX 窗口建立采集源：用 (标题, 尺寸) 从 SCK 的枚举结果里找对应窗口。
+    public func makeCaptureSource(for info: WindowInfo, streamID: String) -> CaptureSource? {
+        guard ax.available, sck.available else { return nil }
+        // 触发一次 SCK 枚举以刷新缓存
+        _ = sck.refresh()
+        let candidate = sck.matchWindow(title: info.title, size: info.contentSize)
+        guard let window = candidate else {
+            matchFailures.append("\(info.title) \(Int(info.contentSize.width))x\(Int(info.contentSize.height))")
+            return nil
+        }
+        let source = SCKWindowCaptureSource(streamID: streamID, window: window)
+        return source.isAvailable ? source : nil
     }
 }

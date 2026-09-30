@@ -95,6 +95,8 @@ var hostCommitExecutor: TextCommitExecutor?
 var hostDemoProxy: DemoAppProxy?
 /// 真实采集的窗口提供者（需要它来把窗口映射为可采集的 SCWindow）
 var hostRealCaptureProvider: SCKWindowProvider?
+/// 真实模式的窗口提供者（AX 枚举 + SCK 采集的桥接）
+var hostRealWindowProvider: RealWindowProvider?
 
 let runRoot = hostOptions.runDir.map { URL(fileURLWithPath: $0) }
     ?? FileManager.default.temporaryDirectory.appendingPathComponent("m2m-host-\(UUID().uuidString.prefix(8))")
@@ -113,15 +115,25 @@ func resolveTargetPID() -> pid_t? {
 if (hostOptions.realCapture || hostOptions.useReal), let pid = resolveTargetPID() {
     // 真实路径：屏幕录制权限足以枚举与采集窗口；辅助功能权限额外解锁
     // 尺寸修改、输入注入与插入点读取。缺哪一项就如实降级并提示，不静默伪装。
-    let sck = SCKWindowProvider(targetPID: pid,
-                                bundleID: hostOptions.targetBundle ?? "unknown",
-                                displayName: NSRunningApplication(processIdentifier: pid)?
-                                    .localizedName ?? "目标应用")
-    hostWindowProvider = sck
-    hostRealCaptureProvider = sck
+    let displayName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "目标应用"
+    let bundleID = hostOptions.targetBundle ?? "unknown"
+    let sck = SCKWindowProvider(targetPID: pid, bundleID: bundleID, displayName: displayName)
+    let axWin = AXWindowProvider(targetPID: pid, bundleID: bundleID, displayName: displayName)
+    let hasAX = AXIsProcessTrusted()
+    if hasAX {
+        // 有辅助功能权限：枚举与操作走 AX（身份一致，尺寸请求能落到正确窗口），
+        // 采集用 SCK 并与 AX 的窗口按 (标题, 尺寸) 对应
+        let real = RealWindowProvider(ax: axWin, sck: sck)
+        hostWindowProvider = real
+        hostRealCaptureProvider = sck
+        hostRealWindowProvider = real
+    } else {
+        // 只有屏幕录制权限：能看画面，不能操作
+        hostWindowProvider = sck
+        hostRealCaptureProvider = sck
+    }
 
     let axText = AXTextContextProvider(targetPID: pid)
-    let hasAX = AXIsProcessTrusted()
     if hasAX {
         hostTextProvider = axText
         hostCommitExecutor = AXTextCommitExecutor(targetPID: pid)
@@ -200,6 +212,14 @@ func ensureCaptureSources() {
         // 真实采集：优先用 ScreenCaptureKit；失败时回落到合成源并记录原因
         if let real = hostRealCaptureProvider, hostCapability.captureMode == .realWindowCapture {
             if captureSources[w.windowUID] == nil {
+                // 若已构建 AX↔SCK 桥接，优先用它按 (标题, 尺寸) 精确对应
+                if let bridge = hostRealWindowProvider,
+                   let source = bridge.makeCaptureSource(for: w, streamID: streamID) {
+                    if let sckSource = source as? SCKWindowCaptureSource { sckSource.start() }
+                    captureSources[w.windowUID] = source
+                    logHost("真实采集已登记：\(w.title)（AX 身份，已与 SCK 窗口对应）")
+                    continue
+                }
                 let r = RealCaptureFactory.makeSource(provider: real, uid: w.windowUID, streamID: streamID)
                 if let source = r.source {
                     if let sckSource = source as? SCKWindowCaptureSource {
@@ -315,6 +335,8 @@ func writeHostState() {
         "notices": hostRuntime.notices.map(jsonSafe),
         "received_files": hostFileBridge.completedNames,
         "capture_failures": hostCaptureFailures,
+        "sck_match_failures": hostRealWindowProvider?.matchFailures ?? [],
+        "filtered_degenerate_windows": hostRealWindowProvider?.filteredDegenerateWindows ?? 0,
         "real_capture_windows": captureSources.compactMap { (uid, src) -> String? in
             (src as? SCKWindowCaptureSource) != nil ? uid : nil
         },
@@ -358,10 +380,12 @@ hostTimer.setEventHandler {
     if hostCapability.captureMode == .realWindowCapture {
         for (uid, src) in captureSources {
             guard let sck = src as? SCKWindowCaptureSource else { continue }
-            if let px = sck.lastCapturedSize, px != hostRuntime.streams[uid]?.contentSizePx {
+            guard let px = sck.lastCapturedSize, !px.isEmpty else { continue }
+            if px != hostRuntime.streams[uid]?.contentSizePx {
                 hostRuntime.noteCapturePixelSize(windowUID: uid, size: px)
-                logHost("采集像素尺寸：\(uid) → \(Int(px.width))x\(Int(px.height))")
             }
+            // 采集像素尺寸只用于媒体侧（编码像素量 / 几何映射），不再回写窗口尺寸：
+            // 像素尺寸与 AX 的 AXSize 同为窗口框，回写只会引入第二个不一致的事实来源。
         }
     }
     hostRuntime.tick(now: now)

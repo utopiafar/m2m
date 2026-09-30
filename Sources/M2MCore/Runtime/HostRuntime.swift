@@ -302,8 +302,21 @@ public final class HostRuntime {
         lastTickTime = now
         publishDelta(force: false)
         publishTextContext()
+        // 周期性重发全量窗口快照。
+        //
+        // 只在握手时发一次快照是不够的：快照可能丢失，对端也可能在快照之后才完成接入，
+        // 此时又没有任何窗口变化来触发增量，于是接收端会长时间停在"一个窗口都没有"。
+        // 周期重发让状态收敛不再依赖"握手与快照恰好配对成功"。
+        if now - lastSnapshotAt >= snapshotRefreshInterval {
+            lastSnapshotAt = now
+            publishSnapshot(force: true, now: now)
+        }
         pumpCapture(now: now)
     }
+
+    /// 全量快照的重发间隔。几百字节的状态消息，代价可以忽略。
+    public var snapshotRefreshInterval: TimeInterval = 3.0
+    private var lastSnapshotAt: TimeInterval = 0
 
     /// 更新某窗口流的**采集像素尺寸**。
     ///
@@ -468,9 +481,18 @@ public final class HostRuntime {
         for w in wins { registry.upsert(w) }
         bus.send(WindowSnapshot(epoch: session.epoch, layoutVersion: registry.layoutVersion, windows: wins),
                  type: .windowSnapshot)
+        lastSnapshotAt = lastTickTime
         var dict: [String: WindowInfo] = [:]
         for w in wins { dict[w.windowUID] = w }
         lastSnapshotWindows = dict
+        // 幂等重发已有流的描述。
+        //
+        // StreamInfo 只发一次是不够的：丢一次（或对端在发送之后才接入）之后，
+        // 接收端永远不知道该流属于哪个窗口，于是**静默丢弃该窗口的全部画面**，
+        // 表现为"主机一直在发帧、本地一帧都没有"。周期性重发让状态自愈。
+        for (_, stream) in streams {
+            bus.send(stream, type: .streamInfo)
+        }
         for w in wins where streams[w.windowUID] == nil && w.role.requiresLocalShell {
             let streamID = "stream:\(w.windowUID)"
             let stream = StreamInfo(streamID: streamID, windowUID: w.windowUID,

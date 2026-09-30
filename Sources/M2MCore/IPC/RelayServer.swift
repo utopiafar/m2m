@@ -157,6 +157,12 @@ public final class RelayServer {
         viewer?.close()
     }
 
+    /// 已接入的端点数（0/1/2）。编排器据此判断"两端都就位"，而不是只看状态文件存在。
+    public var connectedEndpointCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return (hostConnection != nil ? 1 : 0) + (viewerConnection != nil ? 1 : 0)
+    }
+
     public var statusDescription: String {
         let h = hostConnection != nil ? "已接入" : "未接入"
         let v = viewerConnection != nil ? "已接入" : "未接入"

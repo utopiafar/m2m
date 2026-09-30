@@ -28,6 +28,8 @@ public final class ViewerRuntime {
     public private(set) var decodedFrames: [String: DecodedFrame] = [:]
     public private(set) var framesReceived = 0
     public private(set) var framesDroppedStale = 0
+    /// 因"流描述未知"而丢弃的帧数（用于暴露状态未收敛，而不是静默无画面）
+    public private(set) var framesDroppedUnknownStream = 0
     public private(set) var keyframeRequestsSent = 0
     /// 运行时自身的提示（能力、窗口、文件等）。
     private var localNotices: [Notice] = []
@@ -232,7 +234,19 @@ public final class ViewerRuntime {
     private func handleMediaFrame(_ data: Data) {
         guard let wire = try? MediaFrameWire.decode(data) else { return }
         let frame = wire.asEncodedFrame
-        guard let windowUID = streamToWindow[wire.streamID] ?? streams[wire.streamID]?.windowUID else { return }
+        guard let windowUID = streamToWindow[wire.streamID] ?? streams[wire.streamID]?.windowUID else {
+            // 未知流不能静默丢弃：这是"主机在发、本地一帧没有"这类问题的唯一线索。
+            // 计入诊断，并请求一次关键帧（若随后收到 StreamInfo 即可恢复）。
+            framesDroppedUnknownStream += 1
+            if framesDroppedUnknownStream == 1 {
+                localNotices.append(Notice(severity: .warning, scope: .media,
+                                      title: "收到未知流的画面",
+                                      detail: "流 \(wire.streamID) 尚未收到描述信息，已丢弃 \(framesDroppedUnknownStream) 帧",
+                                      code: "media.unknownStream"))
+            }
+            requestKeyframes()
+            return
+        }
         do {
             if let decoded = try receiver.ingest(frame, decoder: decoder, currentLayoutVersion: layoutVersion) {
                 decodedFrames[windowUID] = decoded
@@ -260,6 +274,13 @@ public final class ViewerRuntime {
         }
         receiver.requestKeyframe()
         bus.send(KeyframeRequest(streamID: "*", reason: .connect), type: .keyframeRequest)
+        keyframeRequestsSent += 1
+    }
+
+    /// 请求所有已知流的关键帧（重连、未知流恢复时使用）。
+    public func requestKeyframes() {
+        receiver.requestKeyframe()
+        bus.send(KeyframeRequest(streamID: "*", reason: .resume), type: .keyframeRequest)
         keyframeRequestsSent += 1
     }
 

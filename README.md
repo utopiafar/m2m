@@ -99,7 +99,7 @@ swift test
 ## 项目状态
 
 - `swift test`：**254 项测试全绿**（协议编解码、几何映射、窗口生命周期、中文输入桥、媒体管线、文件桥、输入路由、会话恢复、弱网矩阵、安全与配对、AppKit 事件与系统剪贴板、端到端集成）
-- `m2mctl selftest`：**9/9 场景通过**（四进程隔离，含真实屏幕采集），报告见 [docs/reports/automated-test-report.md](docs/reports/automated-test-report.md)
+- `m2mctl selftest`：**10/10 场景通过**（四进程隔离，含真实屏幕采集与真实 AX 路径），报告见 [docs/reports/automated-test-report.md](docs/reports/automated-test-report.md)
 - `m2mctl perf`：性能基线见 [docs/reports/performance-baseline.md](docs/reports/performance-baseline.md)
 
 ### 性能基线的关键结论
@@ -115,12 +115,21 @@ swift test
 **"本地交互与网络无关"这一核心主张得到了实测支持**：端到端延迟随注入的 RTT 单调变化，
 而本地交互始终在微秒量级；实现自身的额外开销约为 RTT + 10 ms。
 
+### G1（真实中文输入闭环）：已通过
+
+在带**真实 `NSTextView`** 的目标应用上完成验证，走的是与第三方应用完全相同的代码路径：
+
+| 项 | 结果 |
+|---|---|
+| 插入点读取能力 | ✅ `本地输入法（光标跟随）` |
+| 插入点矩形 | ✅ 读到 `(68, 474, 1×18)`，控件 role=`AXTextArea` |
+| 中文写入真实控件 | ✅ 写入后真实 `NSTextView` 内容确实改变 |
+| 真实缩放重排 | ✅ 请求 700×380，窗口实际变为 700×380 |
+
 ### 尚未验证的部分（诚实边界）
 
-- **真实第三方应用的兼容性没有结论**：按约定用自建 demo 应用验证通用链路。
-  换到具体第三方应用的 AX 覆盖率、`contenteditable` 选区语义、编辑器撤销栈，需要按 G1 单独跑。
-- **真实窗口操作路径未端到端验证**：缺辅助功能权限。代码已就绪，授权清单见
-  [docs/reports/permission-request.md](docs/reports/permission-request.md)。
+- **真实第三方应用的兼容性仍无结论**：验证目标是本仓库的确定性 demo 应用。
+  换到具体第三方应用的 AX 覆盖率、`contenteditable` 选区语义、编辑器撤销栈，仍需单独跑。
 - **中文输入法手感与候选窗视觉位置必须人工判断**：自动化能断言坐标与状态，不能断言手感。
 - **跨境真实线路未测**：所有弱网条件都是单机注入的模型，不是真实家庭宽带的实测。
 

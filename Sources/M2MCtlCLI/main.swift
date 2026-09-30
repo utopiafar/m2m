@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import M2MCore
 
@@ -80,6 +81,14 @@ enum StepAction {
     case expectRealCaptureWindows(Int)
     /// 本地窗口壳数量：给出具体值则必须相等，nil 表示只要求 ≥1
     case expectLocalWindowsExact(Int?)
+    /// 插入点能力必须达到"本地输入法（光标跟随）"
+    case expectCaretCapability
+    /// 焦点必须落在真实可编辑文本控件上
+    case expectRealTextFocus
+    /// 真实 NSTextView 的文本必须包含指定内容（证明 AX 写入真正落到控件上）
+    case expectRealEditorContains(String)
+    /// 真实窗口的尺寸
+    case expectRealWindowSize(Size)
 }
 
 struct Step {
@@ -98,6 +107,8 @@ struct Scenario {
     var visibility: Visibility = .always
     /// 使用真实屏幕采集（启动主机时带 --real-capture 并把目标指向 demo 的可见窗口）
     var usesRealCapture = false
+    /// 使用真实 AX/CGEvent 输入与文本路径（需要辅助功能权限）
+    var usesRealAXPath = false
     /// 真实采集场景的窗口尺寸与码率预算。
     /// 真实屏幕像素的熵远高于合成内容，本仓库的无损 RLE 会产出大得多的帧，
     /// 因此需要更高的预算才能拿到多帧（真实产品用 H.264/HEVC，不在此受限）。
@@ -235,6 +246,28 @@ let scenarioTable: [Scenario] = [
         realCaptureWindowSize: Size(420, 300),
         realCaptureBitrateMbps: 60),
     Scenario(
+        name: "g1-real",
+        summary: "真实 AX 路径：插入点读取 → 真实文本写入 → 真实缩放重排（需辅助功能 + 屏幕录制）",
+        expectation: "能读到真实插入点矩形；文字经 AX 写入真实 NSTextView；缩放后真实窗口重新排版",
+        steps: [
+            Step(description: "等待连接与首帧", action: .sleep(4.0)),
+            Step(description: "主机报告真实采集窗口 ≥1", action: .expectRealCaptureWindows(1)),
+            Step(description: "插入点能力达到「本地输入法（光标跟随）」", action: .expectCaretCapability),
+            Step(description: "聚焦主窗口（AX 需要焦点在编辑控件上才能读到插入点）", action: .focusMain),
+            Step(description: "焦点在主窗口的真实文本控件上", action: .expectRealTextFocus),
+            Step(description: "经 AX 路径写入中文「你好，真实世界」", action: .typeText("你好，真实世界")),
+            Step(description: "真实 NSTextView 内容已改变（证明 AX 写入生效）", action: .expectRealEditorContains("你好，真实世界")),
+            // 尺寸需落在屏幕可用区域内：超出部分会被窗口服务器钳制，
+            // 那是屏幕限制而不是应用限制，不应作为失败
+            Step(description: "缩放到 700x380 并真实重新排版", action: .resize(Size(700, 380))),
+            Step(description: "真实窗口尺寸变为 700x380", action: .expectRealWindowSize(Size(700, 380))),
+        ],
+        visibility: .requiresDisplayAndScreenRecording,
+        usesRealCapture: true,
+        usesRealAXPath: true,
+        realCaptureWindowSize: Size(560, 420)),
+
+    Scenario(
         name: "constraint",
         summary: "尺寸约束：请求小于应用最小尺寸",
         expectation: "本地必须接受应用约束（而不是坚持请求值），远端实际尺寸被读回",
@@ -339,10 +372,12 @@ final class Orchestrator {
         try waitForPath(env.stateFile("demo-state.json").path, timeout: 6)
     }
 
-    func startHost(windowSize: Size, realCaptureForPID: Int32?, bitrateMbps: Double?) throws {
+    func startHost(windowSize: Size, realCaptureForPID: Int32?, bitrateMbps: Double?,
+                   realAXPath: Bool) throws {
         var args = ["--relay", env.relaySocketPath]
         if let pid = realCaptureForPID {
-            args.append(contentsOf: ["--real-capture", "--pid", String(pid)])
+            // --real 同时启用真实采集与真实 AX/CGEvent 输入与文本路径
+            args.append(contentsOf: [realAXPath ? "--real" : "--real-capture", "--pid", String(pid)])
         } else {
             args.append(contentsOf: ["--demo-socket", env.demoAppSocketPath])
         }
@@ -362,6 +397,11 @@ final class Orchestrator {
         if headless { args.append("--headless") }
         try spawn("m2mviewer", args: args, role: "viewer")
         try waitForPath(env.stateFile("viewer-state.json").path, timeout: 8)
+        // 两端都接入中继才算就绪：只看状态文件会在"仅一端接入"时过早开始断言
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, (relay?.connectedEndpointCount ?? 0) < 2 {
+            usleep(50_000)
+        }
     }
 
     func waitForPath(_ path: String, timeout: TimeInterval) throws {
@@ -376,8 +416,17 @@ final class Orchestrator {
 
     func stopAll() {
         for (_, p) in processes where p.isRunning { p.terminate() }
-        usleep(400_000)
-        for (_, p) in processes where p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        // 等待子进程真正退出，而不是固定 sleep 一段就往下走：
+        // 残留进程会与下一个场景争抢窗口服务器与 CPU，制造"随机某个场景失败"的假故障。
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline, processes.values.contains(where: { $0.isRunning }) {
+            usleep(50_000)
+        }
+        for (_, p) in processes where p.isRunning {
+            kill(p.processIdentifier, SIGKILL)
+            p.waitUntilExit()
+        }
+        for (_, p) in processes { if p.isRunning { p.waitUntilExit() } }
         processes.removeAll()
         relay?.stop()
         relay = nil
@@ -512,10 +561,12 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
         let windowSize = s.realCaptureWindowSize ?? options.windowSize
         let pid = try orch.startDemoVisible(extraArgs: s.demoArgs, windowSize: windowSize)
         try orch.startHost(windowSize: windowSize, realCaptureForPID: pid,
-                           bitrateMbps: s.realCaptureBitrateMbps)
+                           bitrateMbps: s.realCaptureBitrateMbps,
+                           realAXPath: s.usesRealAXPath)
     } else {
         try orch.startDemo(extraArgs: s.demoArgs, windowSize: options.windowSize)
-        try orch.startHost(windowSize: options.windowSize, realCaptureForPID: nil, bitrateMbps: nil)
+        try orch.startHost(windowSize: options.windowSize, realCaptureForPID: nil,
+                           bitrateMbps: nil, realAXPath: false)
     }
     try orch.startViewer(headless: true)
 
@@ -559,11 +610,17 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
             detail = "已发送 \(requests.count) 条目标应用指令"
 
         case .expectLocalWindows(let expected):
-            let count = waitForValue(timeout: 8, target: expected) {
+            let count = waitForValue(timeout: 12, target: expected) {
                 (orch.readViewerState()["windows"] as? [[String: Any]])?.count ?? 0
             }
             passed = count == expected
-            detail = "本地窗口壳 \(count) 个（期望 \(expected)）"
+            let viewer = orch.readViewerState()
+            let phase = (viewer["phase"] as? Int).map { "\($0)" } ?? "-"
+            let frames = (viewer["frames_received"] as? Int) ?? 0
+            let notices = ((viewer["notices"] as? [[String: Any]]) ?? [])
+                .compactMap { $0["title"] as? String }.joined(separator: "／")
+            detail = "本地窗口壳 \(count) 个（期望 \(expected)）；会话状态=\(phase) 帧数=\(frames)"
+                + (notices.isEmpty ? "" : " 提示=\(notices)")
 
         case .expectRemoteWindows(let expected):
             let count = waitForValue(timeout: 8, target: expected) {
@@ -622,6 +679,58 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
                 passed = count >= 1
                 detail = "本地窗口壳 \(count) 个（要求 ≥1）"
             }
+
+        case .expectCaretCapability:
+            var caps: [String: Any] = [:]
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                caps = (orch.readViewerState()["host_capabilities"] as? [String: Any]) ?? [:]
+                if !caps.isEmpty { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            let caretRect = (caps["caretRect"] as? Bool) ?? false
+            let certified = (caps["certified_apps"] as? [String]) ?? []
+            passed = caretRect && !certified.isEmpty
+            detail = "插入点能力=\(caretRect ? "可用（光标跟随）" : "不可用")；认证应用=\(certified)"
+
+        case .expectRealTextFocus:
+            var role = ""
+            let deadline = Date().addingTimeInterval(8)
+            while Date() < deadline {
+                role = (orch.readViewerState()["ax_focus_role"] as? String) ?? ""
+                if !role.isEmpty { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            passed = role.contains("TextArea") || role.contains("TextField")
+            detail = "焦点控件 role=\(role.isEmpty ? "未读到" : role)"
+
+        case .expectRealEditorContains(let needle):
+            var text = ""
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                text = ((orch.readDemoState()["text"] as? [String: Any])?["real_buffer"] as? String) ?? ""
+                if text.contains(needle) { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            passed = text.contains(needle)
+            detail = "真实 NSTextView 内容=「\(text)」（期望包含「\(needle)」）"
+
+        case .expectRealWindowSize(let expected):
+            var actual = Size(0, 0)
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                if let wins = orch.readHostState()["windows"] as? [[String: Any]],
+                   // 按标题定位主窗口：真实模式下应用可能有多个窗口，
+                   // 只用 role 选会选到尺寸最小的那个内部窗口
+                   let main = wins.first(where: { ($0["title"] as? String) == "M2M Demo App" })
+                       ?? wins.max(by: { (($0["w"] as? Double) ?? 0) < (($1["w"] as? Double) ?? 0) }) {
+                    actual = Size((main["w"] as? Double) ?? 0, (main["h"] as? Double) ?? 0)
+                }
+                if actual == expected { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            passed = actual == expected
+            detail = "真实窗口尺寸 \(Int(actual.width))x\(Int(actual.height))（期望 \(Int(expected.width))x\(Int(expected.height))）"
 
         case .expectRealCaptureWindows(let minimum):
             var count = 0
@@ -817,6 +926,126 @@ func renderMarkdown(_ results: [ScenarioResult], environment: [String: String]) 
     return md
 }
 
+/// AX 自检结果（供退出码使用）。
+nonisolated(unsafe) var axCheckPassed = false
+
+/// 真实 AX 路径自检主体（供 bundle id 与 PID 两条入口复用）。
+func runAXSelfCheck(pid: pid_t, bundleID: String, displayName: String) {
+
+    // 1) 窗口枚举
+    let windows = AXWindowProvider(targetPID: pid, bundleID: bundleID,
+                                    displayName: displayName)
+    let infos = windows.currentWindows()
+    out("")
+    out("【窗口枚举】共 \(infos.count) 个")
+    for w in infos {
+        out("  · \(w.title.isEmpty ? "(无标题)" : w.title)  \(w.role.localizedDescription)  "
+            + "\(Int(w.contentSize.width))x\(Int(w.contentSize.height))  最小尺寸=\(w.constraints.minSize.map { "\(Int($0.width))x\(Int($0.height))" } ?? "未提供")")
+    }
+
+    // 2) 编辑上下文与插入点能力（G1-a 的核心判据）
+    let axText = AXTextContextProvider(targetPID: pid)
+    out("")
+    out("【插入点能力】\(axText.caretRectCapability.localizedDescription)")
+    out("  是否达到「本地输入法体验达标」标准：\(axText.caretRectCapability.meetsCertifiedBar ? "是" : "否")")
+
+    // 3) 真实读取一次上下文
+    let ctx = axText.currentContext()
+    out("")
+    out("【当前编辑上下文】")
+    if let ctx {
+        out("  控件：\(ctx.role.localizedDescription)  可编辑=\(ctx.editable)")
+        out("  插入点有效=\(ctx.caret.valid)  矩形=(x:\(Int(ctx.caret.rectInWindow.origin.x)), "
+            + "y:\(Int(ctx.caret.rectInWindow.origin.y)), "
+            + "\(Int(ctx.caret.rectInWindow.size.width))x\(Int(ctx.caret.rectInWindow.size.height)))")
+        out("  选区=\(ctx.selection.valid ? "位置 \(ctx.selection.location) 长度 \(ctx.selection.length)" : "无")")
+        out("  上下文前文=「\(ctx.contextBefore)」  后文=「\(ctx.contextAfter)」")
+    } else {
+        out("  未读到上下文（焦点不在可编辑控件上）")
+    }
+    let diag = axText.lastDiagnostics
+    out("")
+    out("【诊断】焦点控件=\(diag.focusedElementFound)  插入点矩形=\(diag.caretRectRead)  "
+        + "选区=\(diag.selectionRead)  role=\(diag.role.isEmpty ? "-" : diag.role)")
+    if let reason = diag.failureReason { out("  原因：\(reason)") }
+
+    // 4) 尺寸可写性诊断（G1-d 的前置）
+    out("")
+    out("【尺寸操作诊断】")
+    if let first = infos.first {
+        let canSet = axCanSetSize(pid: pid, uid: first.windowUID)
+        out("  目标窗口：\(first.title)  内容尺寸 \(Int(first.contentSize.width))x\(Int(first.contentSize.height))")
+        out("  能定位到 AX 元素：\(canSet.found)")
+        out("  AXSize 可写：\(canSet.settable)")
+        if canSet.found, canSet.settable {
+            let target = Size(first.contentSize.width + 40, first.contentSize.height + 30)
+            let r = windows.applySize(first.windowUID, requested: target)
+            out("  试改尺寸 → 请求 \(Int(target.width))x\(Int(target.height))  实际 "
+                + "\(Int(r.actual.width))x\(Int(r.actual.height))  约束=\(r.constrainedBy.localizedDescription)")
+        } else if !canSet.found {
+            out("  ⚠️ 未能把 CG 窗口号对应到 AX 元素，尺寸操作会被拒绝（不会操作错窗口）")
+        }
+    } else {
+        out("  没有可操作的窗口（可能应用未打开窗口）")
+    }
+
+    out("")
+    out("提示：要让插入点可读，需把焦点放到目标应用的**文本编辑区**（TextEdit 请新建文稿并点进正文）。")
+    axCheckPassed = axText.caretRectCapability.meetsCertifiedBar
+}
+
+/// 尺寸可写性诊断结果。
+struct AXSizeCapability {
+    var found = false
+    var settable = false
+}
+
+/// 诊断"能否把窗口号对应到 AX 元素、以及 AXSize 是否可写"。
+func axCanSetSize(pid: pid_t, uid: String) -> AXSizeCapability {
+    var result = AXSizeCapability()
+    guard let parsed = CGWindowCatalog.parseUID(uid) else { return result }
+    let app = AXUIElementCreateApplication(pid)
+    var values: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &values) == .success,
+          let list = values as? [AXUIElement] else { return result }
+    let catalog = CGWindowCatalog.windows(forPID: pid, onScreenOnly: false)
+    guard let entry = catalog.first(where: { $0.number == parsed.number }) else { return result }
+
+    func titleOf(_ el: AXUIElement) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXTitleAttribute as CFString, &v) == .success else { return nil }
+        return v as? String
+    }
+    func sizeOf(_ el: AXUIElement) -> CGSize? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &v) == .success,
+              let val = v, CFGetTypeID(val) == AXValueGetTypeID() else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(val as! AXValue, .cgSize, &size) else { return nil }
+        return size
+    }
+
+    if ProcessInfo.processInfo.environment["M2M_AX_DEBUG"] != nil {
+        errOut("[axdbg] CG 窗口号=\(parsed.number) 标题=「\(entry.title)」 框=\(Int(entry.bounds.width))x\(Int(entry.bounds.height))")
+        errOut("[axdbg] AX 候选 \(list.count) 个：")
+        for el in list {
+            let t = titleOf(el) ?? ""
+            let sz = sizeOf(el) ?? .zero
+            let tp: Double = (t.isEmpty || entry.title.isEmpty || t == entry.title) ? 0 : 300
+            let score = tp + abs(Double(sz.width) - Double(entry.bounds.width)) + abs(Double(sz.height) - Double(entry.bounds.height))
+            errOut("[axdbg]   title=「\(t)」 size=\(Int(sz.width))x\(Int(sz.height)) score=\(score)")
+        }
+    }
+    guard let element = AXWindowMatcher.match(entry: entry, candidates: list,
+                                              title: titleOf, size: sizeOf) else { return result }
+    result.found = true
+    var settable: DarwinBoolean = false
+    if AXUIElementIsAttributeSettable(element, kAXSizeAttribute as CFString, &settable) == .success {
+        result.settable = settable.boolValue
+    }
+    return result
+}
+
 // MARK: - 命令分发
 
 switch cli.command {
@@ -878,6 +1107,53 @@ case "selftest":
     out("场景通过：\(passedCount)/\(scenarioTable.count)")
     exit(failures == 0 && passedCount == scenarioTable.count ? 0 : 1)
 
+case "ax":
+    // 真实 AX 路径自检（G1-a）。直接验证项目自己的 AXTextContextProvider，
+    // 而不是另写一份探针——否则测的是探针，不是产品代码。
+    guard AXIsProcessTrusted() else {
+        errOut("缺少辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能")
+        exit(2)
+    }
+    let target = cli.scenario.isEmpty ? "com.apple.TextEdit" : cli.scenario
+    // 允许直接用 PID 指定目标（命令行启动的自建应用没有 bundle id）
+    if let pid = Int32(target) {
+        guard let app = NSRunningApplication(processIdentifier: pid) else {
+            errOut("没有进程号为 \(pid) 的应用")
+            exit(1)
+        }
+        let bundleID = app.bundleIdentifier ?? "unknown"
+        out("目标应用：\(app.localizedName ?? "?")  pid=\(pid)  bundle=\(bundleID)")
+        runAXSelfCheck(pid: pid, bundleID: bundleID, displayName: app.localizedName ?? "目标应用")
+        exit(axCheckPassed ? 0 : 1)
+    }
+    let bundle = target
+    // 若目标应用未运行则启动它（TextEdit 是系统自带、带真实 NSTextView 的最小目标）
+    var apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+    if apps.isEmpty {
+        out("目标应用未运行，正在启动 \(bundle) …")
+        let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle)
+        if let url {
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.activates = true
+            let sem = DispatchSemaphore(value: 0)
+            NSWorkspace.shared.openApplication(at: url, configuration: cfg) { app, _ in
+                apps = app.map { [$0] } ?? []
+                sem.signal()
+            }
+            _ = sem.wait(timeout: .now() + 8)
+        }
+        Thread.sleep(forTimeInterval: 2.5)
+        apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+    }
+    guard let app = apps.first else {
+        errOut("找不到目标应用：\(bundle)")
+        exit(1)
+    }
+    let pid = app.processIdentifier
+    out("目标应用：\(app.localizedName ?? bundle)  pid=\(pid)")
+    runAXSelfCheck(pid: pid, bundleID: bundle, displayName: app.localizedName ?? bundle)
+    exit(0)
+
 case "perf":
     // 性能基线（G3）。在多种链路条件下重复最典型的交互，采集分位数。
     // 本地交互项必须与网络无关——这是分层架构的核心主张，因此单独判定。
@@ -901,7 +1177,8 @@ case "perf":
         }
         try orch.startRelay(conditions: cond)
         try orch.startDemo(extraArgs: [], windowSize: Size(420, 320))
-        try orch.startHost(windowSize: Size(420, 320), realCaptureForPID: nil, bitrateMbps: nil)
+        try orch.startHost(windowSize: Size(420, 320), realCaptureForPID: nil,
+                           bitrateMbps: nil, realAXPath: false)
         try orch.startViewer(headless: true)
         Thread.sleep(forTimeInterval: 2.0)
         orch.sendViewerCommand("focus")
@@ -1006,7 +1283,8 @@ case "up":
     out("隔离运行环境：\(env.root.path)")
     try orch.startRelay(conditions: .lan)
     try orch.startDemo(extraArgs: [], windowSize: cli.windowSize)
-    try orch.startHost(windowSize: cli.windowSize, realCaptureForPID: nil, bitrateMbps: nil)
+    try orch.startHost(windowSize: cli.windowSize, realCaptureForPID: nil,
+                       bitrateMbps: nil, realAXPath: false)
     var viewerArgs = ["--relay", env.relaySocketPath,
                       "--state-file", env.stateFile("viewer-state.json").path,
                       "--run-dir", env.directory(for: .viewer).path]
@@ -1046,6 +1324,7 @@ default:
       m2mctl run <场景>             运行单个场景
       m2mctl selftest               跑完整场景矩阵并生成报告
       m2mctl perf                   采集性能基线（多种链路条件）
+      m2mctl ax [bundle-id]         真实 AX 路径自检（插入点读取能力，G1-a）
       m2mctl up [--no-gui]          启动可交互三端演示
       m2mctl env                    查看隔离运行环境
 

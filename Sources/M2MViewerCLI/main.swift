@@ -216,6 +216,7 @@ func writeViewerState() {
         "streams": Array(viewerRuntime.streams.keys),
         "frames_received": viewerRuntime.framesReceived,
         "frames_dropped_stale": viewerRuntime.framesDroppedStale,
+        "frames_dropped_unknown_stream": viewerRuntime.framesDroppedUnknownStream,
         "keyframe_requests": viewerRuntime.keyframeRequestsSent,
         "text_state": "\(viewerRuntime.textBridge.state)",
         "commit_results": viewerRuntime.commitResults.map { $0.status.localizedDescription },
@@ -245,6 +246,11 @@ func writeViewerState() {
     let budget = viewerRuntime.metrics.localInteractionWithinBudget()
     info["local_interaction_ok"] = budget.ok
     info["local_interaction_detail"] = budget.detail
+    if let ctx = viewerRuntime.textBridge.context {
+        info["ax_focus_role"] = ctx.role == .textArea ? "AXTextArea"
+            : (ctx.role == .textField ? "AXTextField"
+               : (ctx.role == .contentEditable ? "AXTextArea(contentEditable)" : "unknown"))
+    }
     info["caret_valid"] = viewerRuntime.textBridge.context?.caret.valid ?? false
     info["composition"] = viewerRuntime.textBridge.state.isComposing
     if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {

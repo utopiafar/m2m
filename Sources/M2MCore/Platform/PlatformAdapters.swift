@@ -121,46 +121,101 @@ public final class AXWindowProvider: WindowProvider {
 
     private var appElement: AXUIElement { AXUIElementCreateApplication(targetPID) }
 
+    /// 窗口列表。
+    ///
+    /// 身份使用 CoreGraphics 窗口号：它在窗口生命周期内稳定，且能与采集侧对应。
+    /// 窗口的几何与标题优先取自 CG（含标题栏的真实框），AX 只补充约束等细节。
     public func currentWindows() -> [WindowInfo] {
         guard available else { return [] }
-        var values: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &values)
-        guard result == .success, let windowList = values as? [AXUIElement] else { return [] }
+        let catalog = CGWindowCatalog.windows(forPID: targetPID)
+        let axWindows = windowElements()
         var out: [WindowInfo] = []
-        for (idx, win) in windowList.enumerated() {
-            let title = stringAttribute(win, kAXTitleAttribute) ?? ""
-            let size = sizeAttribute(win, kAXSizeAttribute) ?? Size(0, 0)
-            let minimized = boolAttribute(win, kAXMinimizedAttribute) ?? false
-            let resizable = boolAttribute(win, kAXFullScreenButtonAttribute as String) ?? true
-            let subrole = stringAttribute(win, kAXSubroleAttribute)
-            let role = AXWindowProvider.mappedRole(subrole: subrole, isModal: boolAttribute(win, "AXModal") ?? false)
-            guard !size.isEmpty else { continue }
+        for (idx, entry) in catalog.enumerated() {
+            // 尺寸语义：直接采用窗口框尺寸。
+            //
+            // 曾尝试"减去标题栏高度"来得到内容区尺寸，但标题栏高度没有可靠来源
+            // （随系统版本与窗口样式变化），任何估算都会让"请求尺寸"与"读回尺寸"
+            // 产生固定偏差，表现为改尺寸永远差几十点。改用窗口框尺寸后
+            // 请求与读回 1:1 对应，且与采集到的像素尺寸（也是窗口框）一致。
+            let size = Size(Double(entry.bounds.width), Double(entry.bounds.height))
+            guard size.width >= 20, size.height >= 20 else { continue }
+            guard entry.layer >= 0 else { continue }   // 负层级是系统浮层，不属于应用窗口
+            let element = AXWindowMatcher.match(
+                entry: entry, candidates: axWindows,
+                title: { [weak self] in self?.stringAttribute($0, kAXTitleAttribute) },
+                size: { [weak self] el in
+                    guard let s = self?.sizeAttribute(el, kAXSizeAttribute) else { return nil }
+                    return CGSize(width: s.width, height: s.height)
+                })
+            let minSize = element.flatMap { sizeAttribute($0, "AXMinSize") }
+            let resizable = element.flatMap { boolAttribute($0, kAXFullScreenButtonAttribute as String) } ?? true
+            let subrole = element.flatMap { stringAttribute($0, kAXSubroleAttribute) }
+            let modal = element.flatMap { boolAttribute($0, "AXModal") } ?? false
+            let minimized = element.flatMap { boolAttribute($0, kAXMinimizedAttribute) } ?? false
+            let role = AXWindowProvider.mappedRole(subrole: subrole, isModal: modal)
+            let title = entry.title.isEmpty
+                ? (element.flatMap { stringAttribute($0, kAXTitleAttribute) } ?? "")
+                : entry.title
             out.append(WindowInfo(
-                windowUID: "ax:\(targetPID):\(idx):\(title.hashValue)",
+                windowUID: CGWindowCatalog.uid(pid: targetPID, windowNumber: entry.number),
                 appPID: targetPID, appLaunchID: appLaunchID, bundleID: bundleID,
                 title: title.isEmpty ? displayName : title, role: role,
-                parentUID: nil, modal: boolAttribute(win, "AXModal") ?? false,
+                parentUID: nil, modal: modal,
                 contentRect: Rect(origin: Point(0, 0), size: size),
                 contentScale: 2.0,
-                constraints: SizeConstraints(minSize: sizeAttribute(win, "AXMinSize"),
-                                             maxSize: nil,
+                constraints: SizeConstraints(minSize: minSize, maxSize: nil,
                                              resizable: resizable ? .both : .none),
                 minimized: minimized, focusable: true, zOrder: Int32(idx)))
         }
         return out
     }
 
+    private func windowElements() -> [AXUIElement] {
+        var values: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &values) == .success,
+              let list = values as? [AXUIElement] else { return [] }
+        return list
+    }
+
+    /// 改窗口尺寸。
+    ///
+    /// 两个必须处理的差异：
+    /// 1. AX 的 `AXSize` 是**窗口框**（含标题栏），而协议里的尺寸是**内容区**尺寸，
+    ///    因此需要按标题栏高度换算；
+    /// 2. 读回的是窗口框尺寸，同样要换算回内容尺寸再上报。
     public func applySize(_ uid: String, requested: Size) -> (actual: Size, constrainedBy: SizeConstraint) {
         guard available, let win = windowElement(for: uid) else { return (requested, .system) }
-        var size = CGSize(width: requested.width, height: requested.height)
-        if let v = AXValueCreate(.cgSize, &size) {
+        var target = CGSize(width: requested.width, height: requested.height)
+        if let v = AXValueCreate(.cgSize, &target) {
             let setResult = AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, v)
-            if setResult != .success { return (sizeAttribute(win, kAXSizeAttribute) ?? requested, .appMin) }
+            if setResult != .success {
+                let back = sizeAttribute(win, kAXSizeAttribute) ?? requested
+                return (back, .appMin)
+            }
         }
-        // 关键：读回实际尺寸，而不是假定请求生效（规格 §1.2 规则 2）
+        // 关键：读回实际值，而不是假定请求生效（规格 §1.2 规则 2）。
+        // 若应用自身限制尺寸（例如固定纵横比），这里会如实反映出差异。
         let actual = sizeAttribute(win, kAXSizeAttribute) ?? requested
-        let by: SizeConstraint = (abs(actual.width - requested.width) > 1 || abs(actual.height - requested.height) > 1)
-            ? .appMin : .none
+        // 归因：区分"被屏幕可用区域限制"与"被应用自身限制"。
+        // 二者对用户的含义完全不同（前者换个位置就能放大，后者是应用不允许），
+        // 把它们都报成"应用限制"会误导排查方向。
+        var by: SizeConstraint = .none
+        if abs(actual.width - requested.width) > 2 || abs(actual.height - requested.height) > 2 {
+            var posValue: CFTypeRef?
+            var origin = CGPoint.zero
+            if AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posValue) == .success,
+               let pv = posValue, CFGetTypeID(pv) == AXValueGetTypeID() {
+                _ = AXValueGetValue(pv as! AXValue, .cgPoint, &origin)
+            }
+            let screenHeight = Double(NSScreen.screens.map { $0.frame.height }.max() ?? 0)
+            let availableHeight = max(0, screenHeight - Double(origin.y) - 90)
+            if actual.width >= requested.width - 2, actual.height < requested.height - 2,
+               availableHeight > 0, actual.height <= availableHeight + 4 {
+                by = .screen
+            } else {
+                by = .appMin
+            }
+        }
         return (actual, by)
     }
 
@@ -192,15 +247,25 @@ public final class AXWindowProvider: WindowProvider {
         return true
     }
 
+    /// 按稳定身份找回窗口元素。
+    ///
+    /// 身份是 CG 窗口号，需要用 (标题, 尺寸) 从当前 CG 目录里查回它的几何，
+    /// 再与 AX 窗口列表匹配。找不到就返回 nil——**不要退化成"取第一个窗口"**，
+    /// 那会把尺寸请求落到错误的窗口上。
     private func windowElement(for uid: String) -> AXUIElement? {
-        var values: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &values) == .success,
-              let windowList = values as? [AXUIElement] else { return nil }
-        for (idx, win) in windowList.enumerated() {
-            let title = stringAttribute(win, kAXTitleAttribute) ?? ""
-            if uid == "ax:\(targetPID):\(idx):\(title.hashValue)" { return win }
+        let elements = windowElements()
+        guard let parsed = CGWindowCatalog.parseUID(uid), parsed.pid == targetPID else {
+            return nil
         }
-        return windowList.first
+        let catalog = CGWindowCatalog.windows(forPID: targetPID, onScreenOnly: false)
+        guard let entry = catalog.first(where: { $0.number == parsed.number }) else { return nil }
+        return AXWindowMatcher.match(
+            entry: entry, candidates: elements,
+            title: { [weak self] in self?.stringAttribute($0, kAXTitleAttribute) },
+            size: { [weak self] el in
+                guard let s = self?.sizeAttribute(el, kAXSizeAttribute) else { return nil }
+                return CGSize(width: s.width, height: s.height)
+            })
     }
 
     private func stringAttribute(_ el: AXUIElement, _ attr: String) -> String? {
