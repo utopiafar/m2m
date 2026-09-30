@@ -75,20 +75,12 @@ public final class ViewerRuntime {
                                                  code: "auth.rejected"))
                 return
             }
-            // 依据能力声明决定降级提示（不得静默降级）
-            for app in ack.acceptedCapabilities.apps where !app.certified {
-                self.localNotices.append(Notice(severity: .info, scope: .text,
-                                           title: "\(app.displayName) 处于降级模式",
-                                           detail: app.degradationReason ?? app.inputMode.localizedDescription,
-                                           code: "text.degraded.\(app.bundleID)"))
-            }
-            if !ack.acceptedCapabilities.text.caretRect {
-                self.localNotices.append(Notice(severity: .warning, scope: .text,
-                                           title: "远端未提供插入点位置",
-                                           detail: "候选窗将使用近似定位；该应用不会被标记为「本地输入法体验达标」。",
-                                           code: "text.caretRect.unavailable"))
-            }
+            self.applyCapabilities(ack.acceptedCapabilities, announce: true)
             self.session.activate(degraded: !ack.acceptedCapabilities.text.caretRect)
+        }
+        bus.on([.capabilityUpdate]) { [weak self] env in
+            guard let self, let caps = self.bus.decode(env, as: Capabilities.self) else { return }
+            self.applyCapabilities(caps, announce: true)
         }
         bus.on([.windowSnapshot]) { [weak self] env in
             guard let self, let snap = self.bus.decode(env, as: WindowSnapshot.self) else { return }
@@ -163,6 +155,25 @@ public final class ViewerRuntime {
         // 媒体通道是裸帧
         bus.onRaw(.media) { [weak self] data in
             self?.handleMediaFrame(data)
+        }
+    }
+
+    /// 应用能力声明并更新降级提示（不得静默降级，也不得长期显示过期状态）。
+    private func applyCapabilities(_ caps: Capabilities, announce: Bool) {
+        hostCapabilities = caps
+        // 先清掉旧的能力类提示，避免能力恢复后仍留着"降级"字样
+        localNotices.removeAll { $0.code.hasPrefix("text.degraded.") || $0.code == "text.caretRect.unavailable" }
+        for app in caps.apps where !app.certified {
+            localNotices.append(Notice(severity: announce ? .info : .info, scope: .text,
+                                       title: "\(app.displayName) 处于降级模式",
+                                       detail: app.degradationReason ?? app.inputMode.localizedDescription,
+                                       code: "text.degraded.\(app.bundleID)"))
+        }
+        if !caps.text.caretRect {
+            localNotices.append(Notice(severity: .warning, scope: .text,
+                                       title: "远端未提供插入点位置",
+                                       detail: "候选窗将使用近似定位；该应用不会被标记为「本地输入法体验达标」。",
+                                       code: "text.caretRect.unavailable"))
         }
     }
 
@@ -338,11 +349,34 @@ public final class ViewerRuntime {
     }
 
     /// 确认选词并发送。提交只从 `outgoing` 队列取，保证不会重复发送。
+    ///
+    /// **会话未就绪时拒绝发送。** 重连过程中 epoch 由主机权威推进，
+    /// 若在 HelloAck 到达前就把输入发出去，会被主机按"过期代次"丢弃，
+    /// 而 Viewer 侧看不出任何异常——实测表现为"重连后第一条输入静默丢失"。
+    /// 这里返回 0，调用方（输入状态机）会在下一拍重试。
     @discardableResult
     public func confirmComposition(_ text: String, at now: TimeInterval) -> Int {
+        guard inputAllowed else {
+            deferredInputCount += 1
+            return 0
+        }
         _ = textBridge.confirmComposition(text, at: now)
         return flushOutgoingCommits(at: now)
     }
+
+    /// 当前是否允许向远端发送输入。
+    ///
+    /// 只有会话处于活动状态、且握手已完成时才允许。协商中/重连中一律拒绝，
+    /// 由上层重试，避免把消息发进"对端按过期代次丢弃"的黑洞。
+    public var inputAllowed: Bool {
+        switch session.phase {
+        case .active, .degraded: return true
+        default: return false
+        }
+    }
+
+    /// 因会话未就绪而被推迟的输入次数（诊断用）
+    public private(set) var deferredInputCount = 0
 
     /// 记录一次本地组合更新耗时（**必须与网络无关**）。
     public func measureCompositionUpdate<T>(_ body: () -> T) -> T {
@@ -362,6 +396,11 @@ public final class ViewerRuntime {
 
     public func routeAndSendKey(keycode: UInt16, kind: KeyKind, flags: ModifierFlags,
                                 unicode: String?, imeConsumed: Bool) -> InputRouter.KeyDisposition {
+        // 会话未就绪时不把按键发出去（同 confirmComposition 的理由）
+        guard inputAllowed else {
+            deferredInputCount += 1
+            return .rejected("连接尚未就绪")
+        }
         let route = textBridge.routeKey(keycode: keycode, flags: flags, imeConsumed: imeConsumed)
         let disposition = inputRouter.handleKey(keycode: keycode, kind: kind, flags: flags,
                                                unicode: unicode, route: route)
@@ -378,6 +417,10 @@ public final class ViewerRuntime {
                                     button: PointerButton = .none,
                                     scrollDX: Double = 0, scrollDY: Double = 0,
                                     at now: TimeInterval) -> Int {
+        guard inputAllowed else {
+            deferredInputCount += 1
+            return 0
+        }
         let disposition = inputRouter.handlePointer(kind: kind, position: position, button: button,
                                                    scrollDX: scrollDX, scrollDY: scrollDY, now: now)
         switch disposition {
@@ -448,6 +491,8 @@ public final class ViewerRuntime {
     /// 网络中断：释放修饰键、不重放任何输入（规格 §5.2）。
     public func transportInterrupted() {
         session.transportInterrupted(detail: nil)
+        // 立刻停止接受新的输入：断线后发出的输入会被对端丢弃，
+        // 与其静默丢失不如拒绝并由上层重试
         _ = inputRouter.releaseAllKeys()
         windowTable.resetForReconnect()
         decodedFrames.removeAll()
@@ -459,6 +504,8 @@ public final class ViewerRuntime {
     /// 本地不得自行推进 epoch —— 两端各自推进会让对方的合法消息被判为过期。
     /// 也不重放离线期间的任何输入（规格 §5.2）。
     public func reconnect() {
+        // 0) 进入协商：期间 inputAllowed 为 false，输入会被推迟而不是丢弃
+        session.beginNegotiation()
         // 1) 释放按键、丢弃未确认上下文、丢弃画面
         _ = inputRouter.releaseAllKeys()
         inputRouter.setTargetWindow(nil)

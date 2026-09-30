@@ -223,17 +223,7 @@ public final class HostRuntime {
                                   title: "会话已重连", detail: "已重建窗口注册表并要求关键帧",
                                   code: "media.reconnected"))
         }
-        let accepted = Capabilities(
-            media: MediaCapabilities(codecs: [encoder.codec], maxFPS: UInt8(targetFPS), hardwareEncode: false),
-            text: capabilityReport.textCapabilities,
-            adapters: ["generic-macos", "synthetic"],
-            apps: [AppCapability(bundleID: appBundleID, displayName: appDisplayName,
-                                 certified: capabilityReport.textMode.meetsCertifiedBar,
-                                 inputMode: inputModeForCurrentCapability,
-                                 degradationReason: capabilityReport.textMode.meetsCertifiedBar
-                                    ? nil
-                                    : "未提供稳定的插入点位置，本地输入法候选窗无法精确跟随光标")]
-        )
+        let accepted = advertisedCapabilities()
         let effective = accepted.intersected(with: hello.capabilities)
         // 用**旧 epoch** 回复，否则 Viewer 会把它当作过期消息丢弃而永远无法采纳新 epoch
         bus.send(HelloAck(deviceID: hostDeviceID, nonce: hello.nonce,
@@ -317,6 +307,32 @@ public final class HostRuntime {
     /// 全量快照的重发间隔。几百字节的状态消息，代价可以忽略。
     public var snapshotRefreshInterval: TimeInterval = 3.0
     private var lastSnapshotAt: TimeInterval = 0
+
+    /// 周期性重估文本输入能力，并在变化时更新能力上报。
+    ///
+    /// 为什么不能只在启动时算一次：插入点读取能力取决于**读取时刻**的焦点状态。
+    /// 主机启动时目标应用可能还没被激活/聚焦，此时算出的能力是"降级"，
+    /// 但用户真正使用时会话已经就绪、插入点其实可用。
+    /// 沿用启动时的结论会让界面长期显示错误的降级提示（或反过来谎报可用）。
+    public func refreshTextCapability(probe: () -> CapabilityReport.TextAccessMode) {
+        let mode = probe()
+        guard mode != capabilityReport.textMode else { return }
+        let previous = capabilityReport.textMode
+        capabilityReport.textMode = mode
+        localNotices.removeAll { $0.code == "text.capabilityChanged" }
+        localNotices.append(Notice(severity: mode.meetsCertifiedBar ? .info : .warning,
+                                   scope: .text,
+                                   title: "输入法能力已更新",
+                                   detail: "§\(previous.localizedDescription) → \(mode.localizedDescription)",
+                                   code: "text.capabilityChanged"))
+        // 把更新后的能力发给 Viewer：能力只在握手时下发过一次，
+        // 若不在运行时补发，Viewer 会一直显示过期（通常是错误的降级）状态。
+        bus.send(advertisedCapabilities(), type: .capabilityUpdate)
+        publishSnapshot(force: true, now: lastTickTime)
+    }
+
+    /// 当前面向应用的输入模式（随能力变化）。
+    public var currentInputMode: InputMode { inputModeForCurrentCapability }
 
     /// 更新某窗口流的**采集像素尺寸**。
     ///
@@ -504,6 +520,21 @@ public final class HostRuntime {
             keyframeRequests.insert(streamID)
         }
         _ = now
+    }
+
+    /// 本机当前对外声明的能力（握手与运行时更新共用同一份逻辑）。
+    public func advertisedCapabilities() -> Capabilities {
+        Capabilities(
+            media: MediaCapabilities(codecs: [encoder.codec], maxFPS: UInt8(targetFPS), hardwareEncode: false),
+            text: capabilityReport.textCapabilities,
+            adapters: ["generic-macos", "synthetic"],
+            apps: [AppCapability(bundleID: appBundleID, displayName: appDisplayName,
+                                 certified: capabilityReport.textMode.meetsCertifiedBar,
+                                 inputMode: inputModeForCurrentCapability,
+                                 degradationReason: capabilityReport.textMode.meetsCertifiedBar
+                                    ? nil
+                                    : capabilityReport.textMode.degradationExplanation)]
+        )
     }
 
     public var appBundleID: String {

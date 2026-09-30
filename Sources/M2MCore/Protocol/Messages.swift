@@ -16,6 +16,12 @@ public enum MessageType: UInt8, Sendable {
     case streamState = 23
     case textContext = 30
     case textContextInvalidated = 31
+    /// Host → Viewer：运行时的能力更新。
+    ///
+    /// 能力不是常量：插入点是否可用取决于读取时刻的焦点状态，应用也可能重启后
+    /// 改变输入模式。只在握手时下发一次，会让 Viewer 长期显示过期的能力与降级标识。
+    case capabilityUpdate = 37
+
     /// Viewer → Host：请重新下发编辑上下文。
     /// 没有它，Viewer 一旦主动丢弃上下文（切窗口、重连）就无法恢复——
     /// 因为 Host 只在 editVersion 变化时才推送。
@@ -45,7 +51,8 @@ public enum MessageType: UInt8, Sendable {
             return .input
         case .windowSnapshot, .windowDelta, .windowResizeRequest, .windowResizeResult,
              .windowAction, .streamInfo, .streamState, .textContext, .textContextInvalidated,
-             .clipboardUpdate, .keyframeRequest, .streamAdjustRequest, .textContextRequest:
+             .clipboardUpdate, .keyframeRequest, .streamAdjustRequest, .textContextRequest,
+             .capabilityUpdate:
             return .state
         // 文件相关消息必须**全部**在同一通道上：若 offer/chunk 走 file 而 complete 走 state，
         // 优先级调度会让"完成"先于"数据"到达，接收端就会判定为传输超时。
@@ -763,13 +770,25 @@ public struct TextCommit: BinaryCodable, Equatable, Sendable {
 public enum TextCommitStatus: UInt8, BinaryCodable, Sendable, CaseIterable {
     case applied = 0
     case appliedPartial = 1
+    /// 已执行，但**目标控件不提供可读内容**，因此无法校验是否真的生效。
+    ///
+    /// 这个状态不是"可能失败"，而是"无法确认"。它必须与 `rejectedUnsupported`
+    /// 区分开：Chromium（Electron）的 contenteditable 正是这种情况——
+    /// `AXSelectedTextAttribute` 写入会被忽略，而 CGEvent Unicode 注入**确实生效**，
+    /// 但控件不暴露 `AXValue`，程序无法读回校验。
+    /// 把它误判成"不支持"会让用户以为输入失败；误判成"已生效"则是谎报。
+    case appliedUnverified = 6
     case rejectedStale = 2
     case rejectedUnsupported = 3
     case rejectedNoFocus = 4
     /// 超时/连接中断，**执行结果不明** —— 禁止自动重试（规格 §3.2）。
     case unknown = 5
 
-    public var isApplied: Bool { self == .applied || self == .appliedPartial }
+    public var isApplied: Bool {
+        self == .applied || self == .appliedPartial || self == .appliedUnverified
+    }
+    /// 是否需要在界面上说明"未能校验"
+    public var needsVerificationNotice: Bool { self == .appliedUnverified }
     public var isRejected: Bool {
         switch self { case .rejectedStale, .rejectedUnsupported, .rejectedNoFocus: return true; default: return false }
     }
@@ -779,6 +798,7 @@ public enum TextCommitStatus: UInt8, BinaryCodable, Sendable, CaseIterable {
         switch self {
         case .applied: return "已提交"
         case .appliedPartial: return "部分提交"
+        case .appliedUnverified: return "已执行（该控件不支持校验，未能确认结果）"
         case .rejectedStale: return "远端编辑状态已变化，本次未执行"
         case .rejectedUnsupported: return "该输入控件不接受此提交方式"
         case .rejectedNoFocus: return "目标输入框未聚焦"

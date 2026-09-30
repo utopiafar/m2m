@@ -97,6 +97,8 @@ var hostDemoProxy: DemoAppProxy?
 var hostRealCaptureProvider: SCKWindowProvider?
 /// 真实模式的窗口提供者（AX 枚举 + SCK 采集的桥接）
 var hostRealWindowProvider: RealWindowProvider?
+/// 真实模式下的 AX 文本提供者（供周期性能力重估）
+var hostAXTextProvider: AXTextContextProvider?
 
 let runRoot = hostOptions.runDir.map { URL(fileURLWithPath: $0) }
     ?? FileManager.default.temporaryDirectory.appendingPathComponent("m2m-host-\(UUID().uuidString.prefix(8))")
@@ -134,6 +136,7 @@ if (hostOptions.realCapture || hostOptions.useReal), let pid = resolveTargetPID(
     }
 
     let axText = AXTextContextProvider(targetPID: pid)
+    hostAXTextProvider = axText
     if hasAX {
         hostTextProvider = axText
         hostCommitExecutor = AXTextCommitExecutor(targetPID: pid)
@@ -318,7 +321,7 @@ func writeHostState() {
         "phase": hostSession.phase.rawValue,
         "capture_mode": hostCapability.captureMode.rawValue,
         "input_mode": hostCapability.inputMode.rawValue,
-        "text_mode": hostCapability.textMode.rawValue,
+        "text_mode": hostRuntime.capabilityReport.textMode.rawValue,
         "screen_recording": hostCapability.screenRecording.rawValue,
         "accessibility": hostCapability.accessibility.rawValue,
         "frames_sent": hostRuntime.framesSent,
@@ -386,6 +389,15 @@ hostTimer.setEventHandler {
             }
             // 采集像素尺寸只用于媒体侧（编码像素量 / 几何映射），不再回写窗口尺寸：
             // 像素尺寸与 AX 的 AXSize 同为窗口框，回写只会引入第二个不一致的事实来源。
+        }
+    }
+    // 周期性重估文本能力（插入点是否可用取决于读取时刻的焦点状态）
+    if hostTicks % 60 == 0, let axText = hostAXTextProvider {
+        hostRuntime.refreshTextCapability { axText.caretRectCapability }
+    }
+    if hostTicks % 60 == 0, let proxy = hostDemoProxy, let snap = proxy.cachedSnapshotPublic {
+        hostRuntime.refreshTextCapability {
+            snap.text.caretRectValid ? .fullLocalIME : .degradedCaret
         }
     }
     hostRuntime.tick(now: now)

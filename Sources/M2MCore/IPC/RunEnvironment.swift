@@ -102,6 +102,7 @@ public struct DemoRequest: Codable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case hello, snapshot, resize, action, key, pointer, textContext
         case textCommit, setContent, openSettings, openModal, openPopup, close, revokeInput
+        case activateSelfForFocus
     }
     /// 请求标识：响应按它匹配，避免"替换回调"式的竞态。
     public var requestID: String?

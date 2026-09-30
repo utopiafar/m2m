@@ -26,6 +26,10 @@ public final class AXTextContextProvider: TextContextProvider {
         public var selectionRead = false
         public var role: String = ""
         public var failureReason: String?
+        /// 读到了插入点矩形但判定为不可用时的原因（"可读 ≠ 可用"）
+        public var caretRectRejectedReason: String?
+        /// 是否通过"深度搜索聚焦控件"兜底找到（Chromium 常走到这一步）
+        public var foundViaDeepSearch = false
     }
 
     public init(targetPID: pid_t) { self.targetPID = targetPID }
@@ -45,28 +49,125 @@ public final class AXTextContextProvider: TextContextProvider {
         guard let element = focusedElement() else { return .remoteIMEOnly }
         let rect = caretRect(of: element, selectionLength: selection(of: element).length)
         if rect != nil { return .fullLocalIME }
-        // 能读焦点与选区、但读不到插入点矩形 ⇒ 候选窗只能近似定位
+        // 能读焦点与选区、但插入点矩形不可用 ⇒ 候选窗只能近似定位，
+        // 此时**不允许**声称"光标跟随"（P2 的判定规则）
         return selectionReadable(element) ? .degradedCaret : .remoteIMEOnly
     }
 
     // MARK: 读取
 
     private func focusedElement() -> AXUIElement? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &value) == .success,
-              let v = value, CFGetTypeID(v) == AXUIElementGetTypeID() else {
-            lastDiagnostics.focusedElementFound = false
-            lastDiagnostics.failureReason = "无法获取焦点控件（应用可能未激活或无辅助功能权限）"
-            return nil
+        if let el = rawFocusedElement() { return el }
+        // Chromium（Electron）应用在未被辅助功能客户端请求前不构建无障碍树，
+        // 此时读不到焦点控件。先尝试启用再重试一次——这是 Electron 目标
+        // 能否使用本地输入法的前提。
+        let enabled = AXAccessibilityEnabler.enableIfNeeded(pid: targetPID)
+        if enabled.enabledByUs || enabled.wasAlreadyEnabled {
+            if let el = rawFocusedElement() { return el }
         }
-        lastDiagnostics.focusedElementFound = true
-        return (v as! AXUIElement)
+        lastDiagnostics.focusedElementFound = false
+        lastDiagnostics.failureReason = enabled.wasAlreadyEnabled
+            ? "无法获取焦点控件（应用可能未激活）"
+            : "无法获取焦点控件：辅助功能树不可用（\(enabled.description)）"
+        return nil
     }
+
+    /// 读取焦点控件。
+    ///
+    /// 分三级尝试，因为不同实现暴露的位置不同：
+    ///   1. 应用级 `AXFocusedUIElement` —— 原生应用（AppKit）通常在这里
+    ///   2. 窗口级 `AXFocusedUIElement` —— **Chromium/Electron 在这里**：
+    ///      应用级读不到，但窗口级能拿到 web 内容里的焦点元素
+    ///   3. 深度优先搜索标记为聚焦的文本控件 —— 前两级都失败时的兜底
+    private func rawFocusedElement() -> AXUIElement? {
+        if let el = focusedElementOn(appElement) { return el }
+        for window in windowElementsOfApp() {
+            if let el = focusedElementOn(window) { return el }
+        }
+        return nil
+    }
+
+    /// 读取某个元素上的焦点控件。
+    ///
+    /// 关键：Chromium（Electron）在应用/窗口级返回的焦点元素往往是 **`AXWebArea`**
+    /// 这个容器，真正的编辑控件在它的子树里。因此遇到容器时要**向下继续找**，
+    /// 而不是当作"没有焦点控件"直接放弃——那会让 Electron 应用被判为
+    /// "读不到可编辑控件"，从而完全无法使用本地输入法。
+    private func focusedElementOn(_ element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXFocusedUIElementAttribute as CFString, &value) == .success,
+              let v = value, CFGetTypeID(v) == AXUIElementGetTypeID() else { return nil }
+        let el = v as! AXUIElement
+        let role = string(el, kAXRoleAttribute as String) ?? ""
+
+        if isEditableRole(role) {
+            lastDiagnostics.focusedElementFound = true
+            return el
+        }
+        // 容器：在其子树里继续找（Chromium 的焦点元素是 AXWebArea）
+        if Self.containerRoles.contains(role) {
+            if let nested = searchEditableDescendant(el, depth: 0) {
+                lastDiagnostics.focusedElementFound = true
+                lastDiagnostics.foundViaDeepSearch = true
+                return nested
+            }
+        }
+        return nil
+    }
+
+    private static let containerRoles: Set<String> = [
+        "AXApplication", "AXWindow", "AXGroup", "AXWebArea", "AXScrollArea",
+        "AXList", "AXOutline", "AXSplitGroup", "AXTabGroup", "AXSheet", "AXDrawer",
+    ]
+
+    private func isEditableRole(_ role: String) -> Bool {
+        ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role)
+    }
+
+    /// 在子树里找可编辑文本控件。
+    ///
+    /// 优先取标记为聚焦的；Chromium 有时不把 AXFocused 标在编辑控件自身上，
+    /// 因此在"父容器已被判定为焦点"的前提下，也接受第一个可编辑控件。
+    private func searchEditableDescendant(_ element: AXUIElement, depth: Int) -> AXUIElement? {
+        guard depth <= 14 else { return nil }
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else { return nil }
+        // 第一轮：找明确标记为聚焦的可编辑控件
+        for child in children {
+            let role = string(child, kAXRoleAttribute as String) ?? ""
+            if isEditableRole(role), (boolAttribute(child, kAXFocusedAttribute as String) ?? false) {
+                return child
+            }
+        }
+        // 第二轮：递归；对"本身可编辑"的控件在无聚焦标记时也接受
+        for child in children {
+            let role = string(child, kAXRoleAttribute as String) ?? ""
+            if isEditableRole(role) { return child }
+            if let found = searchEditableDescendant(child, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+
+    private func windowElementsOfApp() -> [AXUIElement] {
+        var values: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &values) == .success,
+              let list = values as? [AXUIElement] else { return [] }
+        return list
+    }
+
 
     private func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
         return value
+    }
+
+    private func boolAttribute(_ element: AXUIElement, _ name: String) -> Bool? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &v) == .success else { return nil }
+        if let n = v as? NSNumber { return n.boolValue }
+        return nil
     }
 
     private func string(_ element: AXUIElement, _ name: String) -> String? {
@@ -89,6 +190,12 @@ public final class AXTextContextProvider: TextContextProvider {
     }
 
     /// 插入点矩形。这是候选窗能否"贴近插入点"的前提。
+    ///
+    /// **可读 ≠ 可用。** 实测 VS Code（Monaco 自绘编辑器）会返回一个
+    /// `(0, 956, 1×1)` 这样的矩形：读取成功，但它的位置与尺寸都没有意义，
+    /// 拿它去定位候选窗会让候选窗出现在屏幕上一个毫不相干的地方。
+    /// 因此这里做可用性校验，把"读到了但不可用"如实判为不可用（走降级链路），
+    /// 而不是让它冒充"光标跟随"。
     private func caretRect(of element: AXUIElement, selectionLength: Int) -> Rect? {
         guard let rangeValue = attribute(element, kAXSelectedTextRangeAttribute as String),
               CFGetTypeID(rangeValue) == AXValueGetTypeID() else { return nil }
@@ -105,9 +212,53 @@ public final class AXTextContextProvider: TextContextProvider {
         }
         var rect = CGRect.zero
         guard AXValueGetValue(bv as! AXValue, .cgRect, &rect) else { return nil }
+
+        // 可用性校验 1：至少有一个维度有意义。
+        //
+        // **文本光标是零宽竖条**：实测本机 AppKit 文本框给出的插入点是 `0x18`
+        // （宽 0、高 18）。因此不能要求宽高都大于 0——那会把正常的光标判成不可用。
+        // 而 Chromium 给出的是 `0x0`（宽高皆为零），那不是位置信息，必须拒绝。
+        guard rect.width > 0.5 || rect.height > 0.5 else {
+            lastDiagnostics.caretRectRejectedReason =
+                "插入点矩形尺寸无效（\(Int(rect.width))x\(Int(rect.height))），不是可用的光标位置"
+            return nil
+        }
+        guard rect.width >= 0, rect.height >= 0 else {
+            lastDiagnostics.caretRectRejectedReason = "插入点矩形尺寸为负"
+            return nil
+        }
+        // 可用性校验 2：必须落在焦点窗口内。超出窗口的坐标不是"光标位置"，
+        // 常见于自绘编辑器把插入点报成隐藏文本框的偏移量。
+        if let windowFrame = focusedWindowFrame(element) {
+            let center = CGPoint(x: rect.midX, y: rect.midY)
+            if !windowFrame.insetBy(dx: -4, dy: -4).contains(center) {
+                lastDiagnostics.caretRectRejectedReason =
+                    "插入点矩形落在窗口之外（\(Int(rect.origin.x)), \(Int(rect.origin.y))），不是可用的光标位置"
+                return nil
+            }
+            _ = windowFrame
+        }
         lastDiagnostics.caretRectRead = true
         return Rect(Double(rect.origin.x), Double(rect.origin.y),
-                    max(1, Double(rect.width)), max(1, Double(rect.height)))
+                    Double(rect.width), Double(rect.height))
+    }
+
+    /// 焦点元素所属窗口的框（用于判断插入点是否落在窗口内）。
+    private func focusedWindowFrame(_ element: AXUIElement) -> CGRect? {
+        guard let windowRef = attribute(element, kAXWindowAttribute as String),
+              CFGetTypeID(windowRef) == AXUIElementGetTypeID() else { return nil }
+        let win = windowRef as! AXUIElement
+        var sizeValue: CFTypeRef?
+        var posValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posValue) == .success,
+              let sv = sizeValue, CFGetTypeID(sv) == AXValueGetTypeID(),
+              let pv = posValue, CFGetTypeID(pv) == AXValueGetTypeID() else { return nil }
+        var size = CGSize.zero, origin = CGPoint.zero
+        guard AXValueGetValue(sv as! AXValue, .cgSize, &size),
+              AXValueGetValue(pv as! AXValue, .cgPoint, &origin),
+              size.width > 1, size.height > 1 else { return nil }
+        return CGRect(origin: origin, size: size)
     }
 
     public func currentContext() -> TextContext? {
@@ -222,6 +373,8 @@ public final class AXTextCommitExecutor: TextCommitExecutor {
         public var axSelectionInsert = 0
         public var cgEventInsert = 0
         public var rejected = 0
+        /// AX 写入返回成功但内容未改变的次数（Chromium 系常见）
+        public var axWriteIgnored = 0
         public var lastPath: String = ""
     }
 
@@ -250,30 +403,75 @@ public final class AXTextCommitExecutor: TextCommitExecutor {
         case .insertText, .newline, .replaceSelection:
             // 路径 1：AX 选区写入。语义上等价于"用这段文字替换当前选区/插入点"，
             // 因此保留前后文本；这与"整框覆盖"有本质区别。
+            //
+            // **必须读回校验。** 实测 Chromium（Electron）对
+            // `kAXSelectedTextAttribute` 的写入返回 `.success`，但控件内容毫无变化。
+            // 只凭 API 返回值判定成功，就会变成"界面显示已提交、文字从未出现"——
+            // 这是最危险的一类失败，因为它不报错。
+            let before = textValue(of: element)
             var settable: DarwinBoolean = false
             if AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success,
                settable.boolValue {
-                let result = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString,
-                                                         commit.text as CFString)
-                if result == .success {
+                _ = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString,
+                                                 commit.text as CFString)
+                let after = textValue(of: element)
+                if didApply(before: before, after: after, committed: commit.text) {
                     stats.axSelectionInsert += 1
                     stats.lastPath = "AXSelectedText"
                     return TextCommitResult(commitSeq: commit.commitSeq, status: .applied,
                                             appliedRange: SelectionInfo(valid: true, location: 0,
                                                                         length: commit.text.count),
-                                            detail: "AX 选区写入")
+                                            detail: "AX 选区写入（已读回校验）")
                 }
+                stats.axWriteIgnored += 1
             }
-            // 路径 2：CGEvent 携带已确认文字
-            if let r = cgEventInsert(commit) {
+            // 路径 2：CGEvent 携带已确认文字（也就是真实用户按键走的通道）
+            _ = cgEventInsert(commit)
+            let afterEvent = textValue(of: element)
+            if didApply(before: before, after: afterEvent, committed: commit.text) {
                 stats.cgEventInsert += 1
                 stats.lastPath = "CGEventUnicode"
-                return r
+                return TextCommitResult(commitSeq: commit.commitSeq, status: .applied,
+                                        appliedRange: SelectionInfo(valid: true, location: 0,
+                                                                    length: commit.text.count),
+                                        detail: "CGEvent Unicode（已读回校验）")
+            }
+            // 关键区分：控件**根本不提供可读内容**（before/after 皆为 nil）时，
+            // 我们既不能确认成功、也没有证据说失败。实测 Chromium 的 contenteditable
+            // 就是这种情况：注入确实生效了，但 AXValue 读不到。
+            // 此时如实报告"已执行但无法校验"，让界面提示用户，而不是谎报成功或谎报失败。
+            if before == nil && afterEvent == nil {
+                stats.cgEventInsert += 1
+                stats.axWriteIgnored += 1
+                stats.lastPath = "CGEventUnicodeUnverified"
+                return TextCommitResult(commitSeq: commit.commitSeq, status: .appliedUnverified,
+                                        detail: "已通过 Unicode 事件注入，但该控件不提供可读内容，"
+                                            + "无法程序化校验（Chromium 系应用的常见情况）")
             }
             stats.rejected += 1
+            stats.lastPath = "none"
             return TextCommitResult(commitSeq: commit.commitSeq, status: .rejectedUnsupported,
-                                    detail: "焦点控件不接受 AX 语义写入，也未接受 Unicode 事件")
+                                    detail: "两条写入路径均未生效：控件接受了调用但内容未改变"
+                                        + "（该控件可能不允许程序化写入，需按应用单独适配）")
         }
+    }
+
+    private func textValue(of element: AXUIElement) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &v) == .success else {
+            return nil
+        }
+        return v as? String
+    }
+
+    /// 判定写入是否真的生效：内容必须发生变化，且包含本次提交的文字。
+    ///
+    /// 无法读回内容（nil）时保守判为未生效——宁可让用户知道"没成功"，
+    /// 也不要让界面显示成功而实际什么都没发生。
+    private func didApply(before: String?, after: String?, committed: String) -> Bool {
+        guard let after else { return false }
+        if let before, after == before { return false }
+        return committed.isEmpty ? true : after.contains(committed)
     }
 
     /// 用键盘事件表达删除，保证远端撤销链与原生行为一致。

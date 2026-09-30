@@ -151,6 +151,10 @@ public final class DemoAppService {
         case .revokeInput:
             model.acceptsInput = !(request.revoke ?? false)
             return DemoResponse(ok: true, snapshot: snapshot())
+        case .activateSelfForFocus:
+            // 目标应用自我激活由各应用自己实现（Electron 由主进程处理；
+            // 原生 demo 无窗口前台概念，这里视作无操作）
+            return DemoResponse(ok: true, snapshot: snapshot())
         }
     }
 

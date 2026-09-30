@@ -170,10 +170,20 @@ public final class AXWindowProvider: WindowProvider {
         return out
     }
 
+    /// AX 窗口元素列表。
+    ///
+    /// 读不到时会尝试启用辅助功能树并重试：Chromium（Electron）应用在未被
+    /// 辅助功能客户端请求前不构建无障碍树，表现为"窗口枚举不到、控件全无"。
     private func windowElements() -> [AXUIElement] {
+        if let list = rawWindowElements(), !list.isEmpty { return list }
+        guard AXAccessibilityEnabler.enableIfNeeded(pid: targetPID).enabledByUs else { return [] }
+        return rawWindowElements() ?? []
+    }
+
+    private func rawWindowElements() -> [AXUIElement]? {
         var values: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &values) == .success,
-              let list = values as? [AXUIElement] else { return [] }
+              let list = values as? [AXUIElement] else { return nil }
         return list
     }
 
@@ -241,9 +251,18 @@ public final class AXWindowProvider: WindowProvider {
     }
 
     public func activate(_ uid: String) -> Bool {
-        guard available, let win = windowElement(for: uid) else { return false }
+        guard available else { return false }
+        // 先激活**应用本身**：macOS 只在应用处于活动状态时才通过
+        // `AXFocusedUIElement` 报告焦点控件。只设置窗口的 AXMain/AXFocused
+        // 对原生应用够用，但对 Chromium（Electron）不够——
+        // 表现为"窗口激活了，但读不到任何控件的插入点"。
+        let appActivated = NSRunningApplication(processIdentifier: targetPID)?
+            .activate(options: [.activateAllWindows]) ?? false
+        guard let win = windowElement(for: uid) else { return appActivated }
         AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(win, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        usleep(120_000)   // 给应用切换前台的时间，避免紧接着读取时仍是旧焦点
         return true
     }
 

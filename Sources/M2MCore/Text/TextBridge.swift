@@ -303,9 +303,12 @@ public final class TextBridge {
         }
         pendingCommitAt = nil
         switch result.status {
-        case .applied, .appliedPartial:
+        case .applied, .appliedPartial, .appliedUnverified:
             if result.status == .appliedPartial {
                 effects.append(.showNotice("本次输入仅部分生效：\(result.detail ?? "远端已接受部分内容")"))
+            }
+            if result.status.needsVerificationNotice {
+                effects.append(.showNotice("该应用不支持输入结果校验：文字已发送，但无法确认是否被接受"))
             }
             let resolved = max(result.newEditVersion ?? 0, pendingContextVersion ?? 0)
             pendingContextVersion = nil

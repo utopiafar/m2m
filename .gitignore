@@ -4,3 +4,7 @@
 *.a
 *.swiftmodule
 .DS_Store
+
+# Electron 依赖（含 130MB+ 的运行时二进制，不入库）
+node_modules/
+TestApps/*/node_modules/

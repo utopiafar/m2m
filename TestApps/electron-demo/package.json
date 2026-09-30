@@ -1,0 +1,13 @@
+{
+  "name": "m2m-electron-demo",
+  "version": "1.0.0",
+  "description": "被代理的 Electron 目标应用：用于验证 Chromium 系的 AX 覆盖率、contenteditable 与虚拟滚动",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^44.5.1"
+  }
+}

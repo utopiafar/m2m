@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>M2M Electron Demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0; padding: 12px;
+         display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+  h1 { font-size: 15px; margin: 0 0 8px; font-weight: 600; }
+  #list { flex: 1; overflow-y: auto; border: 1px solid rgba(128,128,128,.35);
+          border-radius: 6px; padding: 8px; font-size: 12px; line-height: 1.7; }
+  .msg { padding: 2px 0; border-bottom: 1px solid rgba(128,128,128,.12); }
+  #composer { margin-top: 10px; display: flex; gap: 8px; align-items: flex-end; }
+  /* contenteditable 是 Electron 聊天类应用的典型输入控件，也是本项目最关心的场景 */
+  #input { flex: 1; min-height: 34px; max-height: 120px; overflow-y: auto;
+           border: 1px solid rgba(128,128,128,.5); border-radius: 6px;
+           padding: 7px 9px; font-size: 14px; outline: none; }
+  #input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,.25); }
+  #textarea { width: 100%; margin-top: 8px; height: 54px; font-size: 13px;
+              border: 1px solid rgba(128,128,128,.5); border-radius: 6px; padding: 6px 8px; }
+  button { font-size: 13px; padding: 7px 14px; border-radius: 6px; cursor: default; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  #status { font-size: 11px; opacity: .65; margin-top: 6px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+  <h1>M2M Electron Demo（被代理的目标应用）</h1>
+  <div id="list"></div>
+
+  <div id="composer">
+    <div id="input" contenteditable="true" role="textbox" aria-label="消息输入"></div>
+    <button id="send">发送</button>
+  </div>
+
+  <textarea id="textarea" placeholder="原生 textarea（用于与 contenteditable 对照）"></textarea>
+
+  <div class="row">
+    <button id="settings">打开设置窗口</button>
+    <button id="modal">打开模态对话框</button>
+  </div>
+
+  <div id="status">就绪</div>
+
+<script>
+const listEl = document.getElementById('list')
+const inputEl = document.getElementById('input')
+const textareaEl = document.getElementById('textarea')
+const statusEl = document.getElementById('status')
+const MESSAGE_COUNT = 500
+
+// 虚拟滚动：只渲染视口附近的消息。
+// 这是 Electron 应用的常见结构，也是 AX 覆盖率的压力点
+//（滚动后插入点/内容会重建，远程读取必须重新定位）。
+const ROW_H = 22
+const RENDER_MARGIN = 6
+let renderedRange = [0, 0]
+const spacer = document.createElement('div')
+function renderVirtual() {
+  const scrollTop = listEl.scrollTop
+  const viewport = listEl.clientHeight
+  const first = Math.max(0, Math.floor(scrollTop / ROW_H) - RENDER_MARGIN)
+  const last = Math.min(MESSAGE_COUNT, Math.ceil((scrollTop + viewport) / ROW_H) + RENDER_MARGIN)
+  if (first === renderedRange[0] && last === renderedRange[1]) return
+  renderedRange = [first, last]
+  listEl.innerHTML = ''
+  const top = document.createElement('div'); top.style.height = (first * ROW_H) + 'px'
+  const bottom = document.createElement('div'); bottom.style.height = ((MESSAGE_COUNT - last) * ROW_H) + 'px'
+  listEl.appendChild(top)
+  for (let i = first; i < last; i++) {
+    const d = document.createElement('div')
+    d.className = 'msg'; d.textContent = '历史消息 #' + (i + 1) + '：用于验证虚拟滚动下的远程操作'
+    listEl.appendChild(d)
+  }
+  listEl.appendChild(bottom)
+  statusEl.textContent = '已渲染 ' + first + '–' + last + ' / ' + MESSAGE_COUNT
+}
+listEl.addEventListener('scroll', renderVirtual)
+renderVirtual()
+
+// 把输入状态上报给主进程，供跨进程断言
+function report() {
+  window.__m2m?.report({ inputText: inputEl.innerText, caret: getCaretOffset() })
+}
+function getCaretOffset() {
+  const sel = window.getSelection()
+  if (!sel || sel.rangeCount === 0) return 0
+  const range = sel.getRangeAt(0).cloneRange()
+  const pre = range.cloneRange()
+  pre.selectNodeContents(inputEl)
+  pre.setEnd(range.endContainer, range.endOffset)
+  return pre.toString().length
+}
+inputEl.addEventListener('input', report)
+inputEl.addEventListener('keyup', report)
+inputEl.addEventListener('click', report)
+document.addEventListener('selectionchange', report)
+textareaEl.addEventListener('input', () => {
+  window.__m2m?.report({ inputText: textareaEl.value,
+                         caret: textareaEl.selectionStart })
+})
+
+document.getElementById('send').addEventListener('click', () => {
+  statusEl.textContent = '已发送（模拟）：' + inputEl.innerText
+})
+document.getElementById('settings').addEventListener('click', () => {
+  window.__m2m?.report({ lastCommand: 'openSettings' })
+  // 由主进程打开窗口；这里通过快捷键约定触发
+  const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true })
+  document.dispatchEvent(evt)
+})
+document.getElementById('modal').addEventListener('click', () => {
+  window.__m2m?.report({ lastCommand: 'openModal' })
+})
+
+window.__m2m?.onSetInput((text) => {
+  inputEl.innerText = text
+  report()
+})
+window.__m2m?.onFocusInput(() => {
+  inputEl.focus()
+})
+
+inputEl.focus()
+report()
+</script>
+</body>
+</html>

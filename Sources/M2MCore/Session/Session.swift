@@ -95,6 +95,21 @@ public struct CapabilityReport: Equatable, Sendable {
 
         /// 是否达到 P2 对"认证应用"的要求。
         public var meetsCertifiedBar: Bool { self == .fullLocalIME }
+
+        /// 降级的可读解释（用于界面提示与能力上报）。
+        public var degradationExplanation: String {
+            switch self {
+            case .fullLocalIME:
+                return "本地输入法（光标跟随）"
+            case .degradedCaret:
+                return "远端未提供可用的插入点位置：能读到控件与文本，但光标位置不可用，"
+                    + "候选窗只能近似定位（Chromium 系应用的常见情况）"
+            case .remoteIMEOnly:
+                return "未读到可编辑文本控件，本地输入法无法工作"
+            case .unavailable:
+                return "文本输入不可用"
+            }
+        }
     }
 
     public var textCapabilities: TextCapabilities {
