@@ -414,3 +414,49 @@ public final class FrameReceiver {
         decodedChecksums.removeAll()
     }
 }
+
+// MARK: - 帧分析
+//
+// 用途：区分"真实屏幕采集"与"合成渲染"。
+// 合成渲染只用少数几种色块（背景/前景/强调色 + 字形），而真实窗口截图包含
+// 标题栏渐变、抗锯齿文字、阴影、子像素混合，颜色种类高出几个数量级。
+// 这让"真实采集是否真的生效"成为可自动断言的性质，而不是靠肉眼确认。
+public enum FrameAnalysis {
+    public struct Signature: Sendable, Equatable {
+        public var width: Int
+        public var height: Int
+        public var checksum: UInt64
+        /// 抽样统计出的不同颜色数（RGB 去低位后计数）
+        public var distinctColors: Int
+        /// 抽样点的平均亮度，用于识别"全黑/全白"的异常画面
+        public var averageLuma: Double
+
+        public var looksLikeRealScreenContent: Bool {
+            distinctColors >= 64 && averageLuma > 4 && averageLuma < 251
+        }
+    }
+
+    /// 抽样分析一帧。`stride` 越大越快；默认每 7 个像素取 1 个。
+    public static func analyze(_ frame: DecodedFrame, stride: Int = 7) -> Signature {
+        let pixels = frame.pixels
+        var colors = Set<UInt32>()
+        var lumaSum = 0.0
+        var count = 0
+        var i = 0
+        let step = max(1, stride) * 4
+        while i + 3 < pixels.count {
+            let b = UInt32(pixels[i]), g = UInt32(pixels[i + 1])
+            let r = UInt32(pixels[i + 2]), a = UInt32(pixels[i + 3])
+            guard a > 0 else { i += step; continue }
+            // 去掉低 3 位，避免抗锯齿造成的过度细分同时仍保留真实渐变
+            let key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+            colors.insert(key)
+            lumaSum += 0.2126 * Double(r) + 0.7152 * Double(g) + 0.0722 * Double(b)
+            count += 1
+            i += step
+        }
+        return Signature(width: Int(frame.size.width), height: Int(frame.size.height),
+                         checksum: frame.pixelChecksum, distinctColors: colors.count,
+                         averageLuma: count > 0 ? lumaSum / Double(count) : 0)
+    }
+}

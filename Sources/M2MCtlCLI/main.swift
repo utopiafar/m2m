@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import CoreGraphics
 import M2MCore
 
 // m2mctl —— 编排、场景运行与报告生成
@@ -72,6 +74,12 @@ enum StepAction {
     case expectMinFrames(Int)
     case expectDegraded(Bool)
     case expectRemoteSize(Size)
+    /// 画面必须看起来像真实屏幕内容（色彩多样、亮度正常）
+    case expectRealScreenPixels
+    /// 主机必须报告真实采集已生效的窗口数 ≥ n
+    case expectRealCaptureWindows(Int)
+    /// 本地窗口壳数量：给出具体值则必须相等，nil 表示只要求 ≥1
+    case expectLocalWindowsExact(Int?)
 }
 
 struct Step {
@@ -86,6 +94,21 @@ struct Scenario {
     var demoArgs: [String] = []
     var linkConditions: LinkConditions = .lan
     var steps: [Step] = []
+    /// 运行前置条件。不满足时场景被标记为"跳过"而不是"通过"——跳过不等于通过。
+    var visibility: Visibility = .always
+    /// 使用真实屏幕采集（启动主机时带 --real-capture 并把目标指向 demo 的可见窗口）
+    var usesRealCapture = false
+    /// 真实采集场景的窗口尺寸与码率预算。
+    /// 真实屏幕像素的熵远高于合成内容，本仓库的无损 RLE 会产出大得多的帧，
+    /// 因此需要更高的预算才能拿到多帧（真实产品用 H.264/HEVC，不在此受限）。
+    var realCaptureWindowSize: Size?
+    var realCaptureBitrateMbps: Double?
+
+    enum Visibility {
+        case always
+        /// 需要 GUI 会话 + 屏幕录制权限
+        case requiresDisplayAndScreenRecording
+    }
 }
 
 let scenarioTable: [Scenario] = [
@@ -195,6 +218,23 @@ let scenarioTable: [Scenario] = [
             Step(description: "远端文本应为 ABC", action: .expectRemoteText("ABC")),
         ]),
     Scenario(
+        name: "real-capture",
+        summary: "真实屏幕采集（ScreenCaptureKit）——仅需屏幕录制权限",
+        expectation: "主机用 SCK 枚举并采集真实窗口，本地收到的是真实屏幕像素（色彩种类远高于合成渲染）",
+        steps: [
+            Step(description: "等待连接与首帧", action: .sleep(4.0)),
+            Step(description: "主机报告真实采集窗口 ≥1", action: .expectRealCaptureWindows(1)),
+            Step(description: "本地窗口壳出现（≥1，真实应用可能有多个系统窗口）", action: .expectLocalWindowsExact(nil)),
+            Step(description: "画面到达且为真实屏幕像素", action: .expectRealScreenPixels),
+        ],
+        // 该场景需要 GUI 会话与屏幕录制权限；无显示的 CI 环境会跳过（跳过 ≠ 通过）
+        visibility: .requiresDisplayAndScreenRecording,
+        usesRealCapture: true,
+        // 真实像素的熵远高于合成内容，本仓库的无损 RLE 会产出更大的帧，
+        // 因此需要更高预算才能拿到多帧（真实产品用 H.264/HEVC，不受此限）。
+        realCaptureWindowSize: Size(420, 300),
+        realCaptureBitrateMbps: 60),
+    Scenario(
         name: "constraint",
         summary: "尺寸约束：请求小于应用最小尺寸",
         expectation: "本地必须接受应用约束（而不是坚持请求值），远端实际尺寸被读回",
@@ -273,6 +313,21 @@ final class Orchestrator {
         return p
     }
 
+    /// 启动带真实可见窗口的目标应用（真实采集场景使用）。
+    @discardableResult
+    func startDemoVisible(extraArgs: [String], windowSize: Size) throws -> Int32 {
+        var args = ["--socket", env.demoAppSocketPath,
+                    "--state-file", env.stateFile("demo-state.json").path,
+                    "--control-file", env.directory(for: .demo).appendingPathComponent("control.json").path,
+                    "--size", "\(Int(windowSize.width))x\(Int(windowSize.height))"]
+        args.append(contentsOf: extraArgs)
+        let p = try spawn("m2mdemo", args: args, role: "demo")
+        try waitForPath(env.stateFile("demo-state.json").path, timeout: 8)
+        // 等窗口真正出现在屏幕上，否则 SCK 枚举不到
+        Thread.sleep(forTimeInterval: 2.0)
+        return p.processIdentifier
+    }
+
     func startDemo(extraArgs: [String], windowSize: Size) throws {
         var args = ["--socket", env.demoAppSocketPath,
                     "--state-file", env.stateFile("demo-state.json").path,
@@ -284,14 +339,20 @@ final class Orchestrator {
         try waitForPath(env.stateFile("demo-state.json").path, timeout: 6)
     }
 
-    func startHost(windowSize: Size) throws {
-        let args = ["--relay", env.relaySocketPath,
-                    "--demo-socket", env.demoAppSocketPath,
-                    "--state-file", env.stateFile("host-state.json").path,
-                    "--run-dir", env.directory(for: .host).path,
-                    "--size", "\(Int(windowSize.width))x\(Int(windowSize.height))"]
+    func startHost(windowSize: Size, realCaptureForPID: Int32?, bitrateMbps: Double?) throws {
+        var args = ["--relay", env.relaySocketPath]
+        if let pid = realCaptureForPID {
+            args.append(contentsOf: ["--real-capture", "--pid", String(pid)])
+        } else {
+            args.append(contentsOf: ["--demo-socket", env.demoAppSocketPath])
+        }
+        args.append(contentsOf: [
+            "--state-file", env.stateFile("host-state.json").path,
+            "--run-dir", env.directory(for: .host).path,
+            "--size", "\(Int(windowSize.width))x\(Int(windowSize.height))"])
+        if let bitrateMbps { args.append(contentsOf: ["--bitrate", String(bitrateMbps)]) }
         try spawn("m2mhost", args: args, role: "host")
-        try waitForPath(env.stateFile("host-state.json").path, timeout: 8)
+        try waitForPath(env.stateFile("host-state.json").path, timeout: 10)
     }
 
     func startViewer(headless: Bool) throws {
@@ -410,7 +471,29 @@ func findDuplicatedSubstrings(_ s: String) -> [String] {
 
 // MARK: - 场景执行
 
+/// 前置条件检查。不满足时返回原因（场景标记为跳过，**不是通过**）。
+func preflightFailure(_ s: Scenario) -> String? {
+    switch s.visibility {
+    case .always:
+        return nil
+    case .requiresDisplayAndScreenRecording:
+        if CGPreflightScreenCaptureAccess() == false {
+            return "缺少屏幕录制权限"
+        }
+        // 无 GUI 会话时 SCK 也枚举不到窗口
+        if NSScreen.main == nil {
+            return "当前无图形会话（无显示器/未登录）"
+        }
+        return nil
+    }
+}
+
 func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [ScenarioResult]) throws {
+    if let reason = preflightFailure(s) {
+        out("")
+        out("⏭ 场景 \(s.name)：前置条件不满足（\(reason)）→ 跳过，不计入通过")
+        return
+    }
     let env = try RunEnvironment.create(label: s.name)
     env.writeManifest(["scenario": s.name, "summary": s.summary])
     let orch = Orchestrator(env: env)
@@ -424,8 +507,16 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
     out("  隔离运行目录 \(env.root.path)")
 
     try orch.startRelay(conditions: s.linkConditions)
-    try orch.startDemo(extraArgs: s.demoArgs, windowSize: options.windowSize)
-    try orch.startHost(windowSize: options.windowSize)
+    if s.usesRealCapture {
+        // 真实采集需要目标应用有真实可见窗口（SCK 只采集真实窗口）
+        let windowSize = s.realCaptureWindowSize ?? options.windowSize
+        let pid = try orch.startDemoVisible(extraArgs: s.demoArgs, windowSize: windowSize)
+        try orch.startHost(windowSize: windowSize, realCaptureForPID: pid,
+                           bitrateMbps: s.realCaptureBitrateMbps)
+    } else {
+        try orch.startDemo(extraArgs: s.demoArgs, windowSize: options.windowSize)
+        try orch.startHost(windowSize: options.windowSize, realCaptureForPID: nil, bitrateMbps: nil)
+    }
     try orch.startViewer(headless: true)
 
     var stepResults: [StepResult] = []
@@ -468,17 +559,23 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
             detail = "已发送 \(requests.count) 条目标应用指令"
 
         case .expectLocalWindows(let expected):
-            let count = waitForValue(timeout: 5) { (orch.readViewerState()["windows"] as? [[String: Any]])?.count ?? 0 }
+            let count = waitForValue(timeout: 8, target: expected) {
+                (orch.readViewerState()["windows"] as? [[String: Any]])?.count ?? 0
+            }
             passed = count == expected
             detail = "本地窗口壳 \(count) 个（期望 \(expected)）"
 
         case .expectRemoteWindows(let expected):
-            let count = waitForValue(timeout: 5) { (orch.readDemoState()["windows"] as? [[String: Any]])?.count ?? 0 }
+            let count = waitForValue(timeout: 8, target: expected) {
+                (orch.readDemoState()["windows"] as? [[String: Any]])?.count ?? 0
+            }
             passed = count == expected
             detail = "远端窗口 \(count) 个（期望 \(expected)）"
 
         case .expectMinFrames(let minimum):
-            let frames = waitForValue(timeout: 6) { (orch.readViewerState()["frames_received"] as? Int) ?? 0 }
+            let frames = waitForValue(timeout: 8, target: minimum) {
+                (orch.readViewerState()["frames_received"] as? Int) ?? 0
+            }
             passed = frames >= minimum
             detail = "收到画面帧 \(frames)（期望 ≥\(minimum)）"
 
@@ -508,6 +605,58 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
             }
             passed = actual == expected
             detail = "远端实际尺寸 \(Int(actual.width))x\(Int(actual.height))（期望 \(Int(expected.width))x\(Int(expected.height))）"
+
+        case .expectLocalWindowsExact(let expected):
+            var count = 0
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                count = (orch.readViewerState()["windows"] as? [[String: Any]])?.count ?? 0
+                if let expected, count == expected { break }
+                if expected == nil, count >= 1 { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if let expected {
+                passed = count == expected
+                detail = "本地窗口壳 \(count) 个（期望 \(expected)）"
+            } else {
+                passed = count >= 1
+                detail = "本地窗口壳 \(count) 个（要求 ≥1）"
+            }
+
+        case .expectRealCaptureWindows(let minimum):
+            var count = 0
+            let deadline = Date().addingTimeInterval(6)
+            while Date() < deadline {
+                let host = orch.readHostState()
+                count = (host["real_capture_windows"] as? [String])?.count ?? 0
+                if count >= minimum { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            let host = orch.readHostState()
+            let failures = (host["capture_failures"] as? [String]) ?? []
+            passed = count >= minimum
+            detail = "真实采集窗口 \(count) 个（期望 ≥\(minimum)）"
+                + (failures.isEmpty ? "" : "；失败项：\(failures.joined(separator: " / "))")
+
+        case .expectRealScreenPixels:
+            var sig: [String: Any] = [:]
+            // 真实采集在窗口刚出现时可能先只报 idle/blank，给足时间等第一个可用画面
+            let deadline = Date().addingTimeInterval(12)
+            while Date() < deadline {
+                sig = (orch.readViewerState()["frame_signature"] as? [String: Any]) ?? [:]
+                if !sig.isEmpty { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            guard !sig.isEmpty else {
+                passed = false
+                detail = "未收到任何画面帧的像素分析"
+                break
+            }
+            let colors = (sig["distinct_colors"] as? Int) ?? 0
+            let luma = (sig["average_luma"] as? Double) ?? 0
+            let looksReal = (sig["looks_like_real_screen"] as? Bool) ?? false
+            passed = looksReal && colors >= 64
+            detail = "彩色种类 \(colors)（真实屏幕截图通常几百以上；合成渲染仅十余种），平均亮度 \(String(format: "%.1f", luma))，判定为真实屏幕=\(looksReal)"
 
         case .expectDegraded(let degraded):
             Thread.sleep(forTimeInterval: 1.0)
@@ -569,16 +718,17 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
     out("  → \(result.passed ? "通过" : "未通过")（\(result.passedCount)/\(result.steps.count) 步）")
 }
 
-/// 在超时内轮询直到条件满足，返回最后一次观测值。
-func waitForValue(timeout: TimeInterval, _ probe: () -> Int) -> Int {
+/// 在超时内轮询直到达到目标值（≥ target），返回最后一次观测值。
+///
+/// 必须等到**目标值**而不是"刚大于 0"：后者会在机器负载高时读到中间态
+/// （例如窗口壳 1 个而期望 4 个）而误判失败，属于测试脚本自身的竞态。
+func waitForValue(timeout: TimeInterval, target: Int, _ probe: () -> Int) -> Int {
     let deadline = Date().addingTimeInterval(timeout)
     var last = probe()
     while Date() < deadline {
-        if last > 0 { return last }
+        if last >= target { return last }
         Thread.sleep(forTimeInterval: 0.1)
-        let next = probe()
-        if next == last && next > 0 { return next }
-        last = next
+        last = probe()
     }
     return last
 }
@@ -703,6 +853,116 @@ case "selftest":
     out("场景通过：\(passedCount)/\(scenarioTable.count)")
     exit(failures == 0 && passedCount == scenarioTable.count ? 0 : 1)
 
+case "perf":
+    // 性能基线（G3）。在多种链路条件下重复最典型的交互，采集分位数。
+    // 本地交互项必须与网络无关——这是分层架构的核心主张，因此单独判定。
+    let conditions: [(String, LinkConditions)] = [
+        ("局域网", .lan),
+        ("RTT 80ms", .rtt80),
+        ("RTT 160ms", .rtt160),
+        ("RTT 250ms", .rtt250),
+        ("丢包 3%", .loss(0.03)),
+        ("带宽 3Mbps", .bw3Mbps),
+    ]
+    var rows: [[String: String]] = []
+    out("性能基线（每种条件下：建立连接 → 10 次中文提交 → 5 次缩放）")
+    out("")
+    for (label, cond) in conditions {
+        let env = try RunEnvironment.create(label: "perf")
+        let orch = Orchestrator(env: env)
+        defer {
+            orch.stopAll()
+            if !cli.keepRunDir { env.cleanup() }
+        }
+        try orch.startRelay(conditions: cond)
+        try orch.startDemo(extraArgs: [], windowSize: Size(420, 320))
+        try orch.startHost(windowSize: Size(420, 320), realCaptureForPID: nil, bitrateMbps: nil)
+        try orch.startViewer(headless: true)
+        Thread.sleep(forTimeInterval: 2.0)
+        orch.sendViewerCommand("focus")
+        Thread.sleep(forTimeInterval: 0.5)
+        for i in 0..<10 {
+            orch.sendViewerCommand("type", value: "测量\(i)")
+            Thread.sleep(forTimeInterval: 0.45)
+        }
+        for i in 0..<5 {
+            orch.sendViewerCommand("resize", value: "\(420 + i * 20)x\(320 + i * 10)")
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        Thread.sleep(forTimeInterval: 1.5)
+
+        let viewer = orch.readViewerState()
+        let latency = (viewer["latency"] as? [[String: Any]]) ?? []
+        func stat(_ name: String, _ key: String) -> Double {
+            guard let row = latency.first(where: { ($0["name"] as? String) == name }),
+                  let v = row[key] as? Double else { return -1 }
+            return v
+        }
+        let localOk = (viewer["local_interaction_ok"] as? Bool) ?? false
+        rows.append([
+            "链路条件": label,
+            "本地尺寸p95": String(format: "%.3f", stat("本地窗口尺寸生效", "p95_ms")),
+            "本地组合p95": String(format: "%.3f", stat("本地组合更新", "p95_ms")),
+            "提交往返p50": String(format: "%.1f", stat("文本提交往返", "p50_ms")),
+            "提交往返p95": String(format: "%.1f", stat("文本提交往返", "p95_ms")),
+            "帧延迟p50": String(format: "%.1f", stat("画面帧延迟", "p50_ms")),
+            "帧延迟p95": String(format: "%.1f", stat("画面帧延迟", "p95_ms")),
+            "尺寸往返p50": String(format: "%.1f", stat("尺寸请求往返", "p50_ms")),
+            "帧数": "\((viewer["frames_received"] as? Int) ?? 0)",
+            "本地交互达标": localOk ? "是" : "否",
+        ])
+        out("▸ \(label)：本地交互达标=\(localOk ? "是" : "否")  提交往返p50=\(rows.last!["提交往返p50"]!)ms  帧延迟p50=\(rows.last!["帧延迟p50"]!)ms  帧数=\(rows.last!["帧数"]!)")
+    }
+
+    out("")
+    out("| " + rows[0].keys.sorted(by: { a, b in
+        let order = ["链路条件","本地尺寸p95","本地组合p95","提交往返p50","提交往返p95","帧延迟p50","帧延迟p95","尺寸往返p50","帧数","本地交互达标"]
+        return (order.firstIndex(of: a) ?? 99) < (order.firstIndex(of: b) ?? 99)
+    }).joined(separator: " | ") + " |")
+    let keys = rows[0].keys.sorted(by: { a, b in
+        let order = ["链路条件","本地尺寸p95","本地组合p95","提交往返p50","提交往返p95","帧延迟p50","帧延迟p95","尺寸往返p50","帧数","本地交互达标"]
+        return (order.firstIndex(of: a) ?? 99) < (order.firstIndex(of: b) ?? 99)
+    })
+    out("|" + keys.map { _ in "---" }.joined(separator: "|") + "|")
+    for row in rows {
+        out("| " + keys.map { row[$0] ?? "-" }.joined(separator: " | ") + " |")
+    }
+
+    // 写入报告
+    let reportURL = cli.reportPath.map { URL(fileURLWithPath: $0) }
+        ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("docs/reports/performance-baseline.md")
+    var md = """
+    # m2m 性能基线（G3）
+
+    生成时间：\(ISO8601DateFormatter().string(from: Date()))
+    环境：\(ProcessInfo.processInfo.operatingSystemVersionString) / \(ProcessInfo.processInfo.machineArchitecture)
+
+    **说明**
+
+    - 单位：毫秒。"本地尺寸p95 / 本地组合p95"衡量**本地交互**，按设计**必须与网络条件无关**。
+    - "提交往返 / 帧延迟 / 尺寸往返"是端到端指标，随注入的链路条件变化；它们是链路与实现叠加的结果，
+      不能据此推断某一模块的独立耗时（见 docs/05-media-performance.md §9.3 的测量纪律）。
+    - 链路条件由中继进程按"可靠通道重传、媒体通道丢帧"的模型注入，不是真实跨境线路的实测。
+    - 单次运行的样本量有限（提交 10 次、缩放 5 次），分位数用于发现数量级问题；
+      压力测试需按 docs/06-test-plan.md §4 的矩阵扩充样本。
+
+    | \(keys.joined(separator: " | ")) |
+    |\(keys.map { _ in "---" }.joined(separator: "|"))|
+    """
+    for row in rows {
+        md += "| " + keys.map { row[$0] ?? "-" }.joined(separator: " | ") + " |\n"
+    }
+    try? FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(),
+                                             withIntermediateDirectories: true)
+    do {
+        try md.write(to: reportURL, atomically: true, encoding: .utf8)
+        out("")
+        out("性能基线已写入：\(reportURL.path)")
+    } catch {
+        errOut("写入性能基线失败：\(error.localizedDescription)")
+    }
+
 case "env":
     let env = try RunEnvironment.create(label: "inspect")
     out("隔离运行目录：\(env.root.path)（权限 0700）")
@@ -721,7 +981,7 @@ case "up":
     out("隔离运行环境：\(env.root.path)")
     try orch.startRelay(conditions: .lan)
     try orch.startDemo(extraArgs: [], windowSize: cli.windowSize)
-    try orch.startHost(windowSize: cli.windowSize)
+    try orch.startHost(windowSize: cli.windowSize, realCaptureForPID: nil, bitrateMbps: nil)
     var viewerArgs = ["--relay", env.relaySocketPath,
                       "--state-file", env.stateFile("viewer-state.json").path,
                       "--run-dir", env.directory(for: .viewer).path]
@@ -760,6 +1020,7 @@ default:
       m2mctl scenarios              列出场景
       m2mctl run <场景>             运行单个场景
       m2mctl selftest               跑完整场景矩阵并生成报告
+      m2mctl perf                   采集性能基线（多种链路条件）
       m2mctl up [--no-gui]          启动可交互三端演示
       m2mctl env                    查看隔离运行环境
 

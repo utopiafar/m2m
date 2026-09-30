@@ -12,12 +12,17 @@ public struct MediaFrameWire: BinaryCodable, Sendable {
     public var pixelChecksum: UInt64
     public var streamID: String
     public var payload: Data
+    /// 发送时刻（主机时钟）。单机验证中两端共享同一时钟，因此可直接算端到端延迟。
+    /// 跨机部署时该字段仅用于同机诊断，不参与业务判断（规格 C5：不依赖两端时钟同步）。
+    public var sentAt: Double
 
     public init(codec: CodecKind, isKeyframe: Bool, layoutVersion: UInt64, frameIndex: UInt32,
-                width: Double, height: Double, pixelChecksum: UInt64, streamID: String, payload: Data) {
+                width: Double, height: Double, pixelChecksum: UInt64, streamID: String, payload: Data,
+                sentAt: Double = 0) {
         self.codec = codec; self.isKeyframe = isKeyframe; self.layoutVersion = layoutVersion
         self.frameIndex = frameIndex; self.width = width; self.height = height
         self.pixelChecksum = pixelChecksum; self.streamID = streamID; self.payload = payload
+        self.sentAt = sentAt
     }
 
     public init(_ frame: EncodedFrame) {
@@ -25,7 +30,7 @@ public struct MediaFrameWire: BinaryCodable, Sendable {
                   frameIndex: UInt32(truncatingIfNeeded: frame.frameIndex),
                   width: frame.size.width, height: frame.size.height,
                   pixelChecksum: frame.pixelChecksum ?? 0, streamID: frame.streamID,
-                  payload: frame.payload)
+                  payload: frame.payload, sentAt: Date().timeIntervalSinceReferenceDate)
     }
 
     public var asEncodedFrame: EncodedFrame {
@@ -44,6 +49,7 @@ public struct MediaFrameWire: BinaryCodable, Sendable {
         writer.writeDouble(height)
         writer.writeUInt(pixelChecksum)
         writer.writeString(streamID)
+        writer.writeDouble(sentAt)
         writer.writeBytes(payload)
     }
 
@@ -56,6 +62,7 @@ public struct MediaFrameWire: BinaryCodable, Sendable {
         height = try reader.readDouble()
         pixelChecksum = try reader.readUInt()
         streamID = try reader.readString()
+        sentAt = try reader.readDouble()
         payload = try reader.readBytes()
     }
 }

@@ -531,3 +531,45 @@ public final class MutableTextContextProvider: TextContextProvider {
         return c.editVersion
     }
 }
+
+// MARK: - AppKit 层按键去向决策
+
+/// 本地客户端 `keyDown` 的按键处理路径。
+///
+/// 这里必须区分清楚，否则很容易写出"非组合态的回车被 IME 吞掉"或
+/// "组合态的回车直接发往远端"这类错误：
+///
+/// - `shortcutToRemote`：明确的快捷键，绕过输入法直接发往远端
+/// - `interpretByIME`：先交给本地输入法；输入法不消费时经 `doCommand(by:)`
+///   再由应用层映射为远端按键。**非组合态的回车/方向/编辑键走这条路**
+/// - `imeOnly`：组合期间，只允许本地输入法处理；即使它意外不消费也不外发
+public enum KeyHandlingPath: Equatable, Sendable {
+    case shortcutToRemote
+    case interpretByIME
+    case imeOnly
+
+    /// 最终是否会作用到远端（无论经由哪条路径）。
+    public var reachesRemote: Bool {
+        // interpretByIME 在输入法不消费时会经 doCommand 到达远端
+        true
+    }
+}
+
+public enum IMEKeyDecision {
+
+    /// 判定按键的处理路径。
+    public static func path(keycode: UInt16, flags: ModifierFlags,
+                            isComposing: Bool) -> KeyHandlingPath {
+        // 组合期间一律留在本地输入法。
+        // 组合中的 Enter 是"确认选词"，绝不能直接变成远端的发送动作。
+        if isComposing { return .imeOnly }
+        if flags.hasCommandLikeModifier { return .shortcutToRemote }
+        return .interpretByIME
+    }
+
+    /// 便捷判断：是否绕过输入法直接发往远端。
+    public static func sendsDirectlyToRemote(keycode: UInt16, flags: ModifierFlags,
+                                             isComposing: Bool) -> Bool {
+        path(keycode: keycode, flags: flags, isComposing: isComposing) == .shortcutToRemote
+    }
+}

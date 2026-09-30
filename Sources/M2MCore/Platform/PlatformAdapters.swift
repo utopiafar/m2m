@@ -4,6 +4,7 @@ import ApplicationServices
 import CoreGraphics
 import CoreVideo
 import ScreenCaptureKit
+import IOKit.hid
 
 /// 系统权限与能力探测。**只探测，不静默降级**：结果直接驱动 UI 提示。
 public enum SystemCapabilityProbe {
@@ -17,9 +18,21 @@ public enum SystemCapabilityProbe {
         AXIsProcessTrusted() ? .granted : .denied
     }
 
+    /// 输入监控权限的**真实**探测（而不是恒返回未授予）。
+    ///
+    /// 该权限只影响"全局键盘监听"（例如在任何应用前台时捕获快捷键）；
+    /// 窗口内的输入不依赖它，因此缺失时应提示而不是阻断。
     public static func inputMonitoringState() -> CapabilityReport.PermissionState {
-        // 未申请输入监控权限时，报告为"未授予"而不是报错
-        .denied
+        switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
+        case kIOHIDAccessTypeGranted: return .granted
+        case kIOHIDAccessTypeDenied: return .denied
+        default: return .unknown
+        }
+    }
+
+    /// 申请输入监控权限（会弹窗，仅在用户显式要求时调用）。
+    public static func requestInputMonitoring() -> Bool {
+        IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
     }
 
     /// 请求屏幕录制权限（会弹窗，仅在用户显式要求时调用）。
@@ -322,6 +335,34 @@ public final class SCKWindowCaptureSource: NSObject, CaptureSource {
     private let outputQueue = DispatchQueue(label: "m2m.sck.output")
     private let lock = NSLock()
     public private(set) var framesCaptured = 0
+    /// 采集诊断：用于把"采集已启动但没有帧"变成可观测事实
+    public private(set) var samplesReceived = 0
+    public private(set) var samplesRejectedInvalid = 0
+    public private(set) var samplesRejectedNoStatus = 0
+    public private(set) var samplesRejectedIncomplete = 0
+    public private(set) var samplesRejectedNoImage = 0
+    /// 被接受的 idle 帧数（内容未变化但画面仍有效）
+    public private(set) var idleSamplesAccepted = 0
+
+    /// 各 SCFrameStatus 的出现次数。用于区分"窗口不可见（blank）"、
+    /// "内容未变化（idle）"与"正常出帧（complete）"，避免把三者混为一谈。
+    public private(set) var statusHistogram: [Int: Int] = [:]
+
+    public var diagnosticsSummary: String {
+        let hist = statusHistogram.keys.sorted().map { k -> String in
+            let name: String
+            switch SCFrameStatus(rawValue: k) {
+            case .complete: name = "complete"
+            case .idle: name = "idle"
+            case .blank: name = "blank"
+            case .suspended: name = "suspended"
+            case .started: name = "started"
+            default: name = "raw\(k)"
+            }
+            return "\(name)=\(statusHistogram[k] ?? 0)"
+        }.joined(separator: ",")
+        return "样本 \(samplesReceived) [\(hist)]（idle 接受 \(idleSamplesAccepted)）/ 无图像 \(samplesRejectedNoImage) / 产出 \(framesCaptured)"
+    }
 
     public init(streamID: String, window: SCWindow) {
         self.streamID = streamID
@@ -368,6 +409,12 @@ public final class SCKWindowCaptureSource: NSObject, CaptureSource {
     public func pause() { paused = true }
     public func resume() { paused = false }
 
+    /// 最近一次采集到的像素尺寸（不消费帧，供流信息使用）。
+    public var lastCapturedSize: Size? {
+        lock.lock(); defer { lock.unlock() }
+        return latestSize.isEmpty ? nil : latestSize
+    }
+
     public func nextFrame(now: TimeInterval) -> CapturedFrame? {
         guard !paused else { return nil }
         lock.lock()
@@ -379,10 +426,12 @@ public final class SCKWindowCaptureSource: NSObject, CaptureSource {
         framesCaptured += 1
         return CapturedFrame(streamID: streamID, size: size, contentScale: contentScaleValue,
                              layoutVersion: layoutVersion, frameIndex: framesCaptured,
-                             isStatic: false, pixels: px, capturedAt: now)
+                             isStatic: lastSampleWasStatic, pixels: px, capturedAt: now)
     }
 
-    func ingest(pixelBuffer: CVPixelBuffer) {
+    private var lastSampleWasStatic = false
+
+    func ingest(pixelBuffer: CVPixelBuffer, isStatic: Bool = false) {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         let w = CVPixelBufferGetWidth(pixelBuffer)
@@ -402,6 +451,7 @@ public final class SCKWindowCaptureSource: NSObject, CaptureSource {
         latestPixels = out
         latestSize = Size(Double(w), Double(h))
         latestAt = Date().timeIntervalSinceReferenceDate
+        lastSampleWasStatic = isStatic
         lock.unlock()
     }
 }
@@ -409,13 +459,47 @@ public final class SCKWindowCaptureSource: NSObject, CaptureSource {
 extension SCKWindowCaptureSource: SCStreamOutput {
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                        of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid else { return }
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-                as? [[SCStreamFrameInfo: Any]],
-              let statusRaw = attachments.first?[.status] as? Int,
-              let status = SCFrameStatus(rawValue: statusRaw), status == .complete else { return }
-        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        ingest(pixelBuffer: pb)
+        samplesReceived += 1
+        guard type == .screen, sampleBuffer.isValid else {
+            samplesRejectedInvalid += 1
+            return
+        }
+        // 状态字段在桥接后可能是 CFNumber/NSNumber，也可能直接是 Int。
+        // 只按 Int 取值会在部分系统版本上永远取不到，表现为"采集已启动但一帧都没有"。
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+            as? [[SCStreamFrameInfo: Any]]
+        let statusNumber = (attachments?.first?[.status] as? NSNumber)
+            ?? (attachments?.first?[.status] as? Int).map { NSNumber(value: $0) }
+        guard let statusRaw = statusNumber?.intValue else {
+            samplesRejectedNoStatus += 1
+            return
+        }
+        statusHistogram[statusRaw, default: 0] += 1
+        guard let status = SCFrameStatus(rawValue: statusRaw) else {
+            samplesRejectedIncomplete += 1
+            return
+        }
+        // `.idle` 表示"内容自上一帧起未变化"，采样缓冲里通常仍带着当前的画面内容。
+        // 把它当作"无可用图像"会造成"采集已启动、却一帧都取不到"的假故障
+        // ——尤其在窗口刚出现、SCK 尚未报告过一次 complete 的启动阶段。
+        // 因此只把 blank（窗口不可见）与 suspended（采集被挂起）判为不可用。
+        switch status {
+        case .complete:
+            break
+        case .idle:
+            idleSamplesAccepted += 1
+        case .blank, .suspended:
+            samplesRejectedIncomplete += 1
+            return
+        default:
+            samplesRejectedIncomplete += 1
+            return
+        }
+        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            samplesRejectedNoImage += 1
+            return
+        }
+        ingest(pixelBuffer: pb, isStatic: status == .idle)
     }
 }
 

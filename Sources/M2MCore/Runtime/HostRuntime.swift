@@ -305,6 +305,18 @@ public final class HostRuntime {
         pumpCapture(now: now)
     }
 
+    /// 更新某窗口流的**采集像素尺寸**。
+    ///
+    /// 只更新媒体侧事实（编码像素量 / 发送端几何），不触碰窗口逻辑尺寸，
+    /// 因此不会引起 layoutVersion 抖动。
+    public func noteCapturePixelSize(windowUID: String, size: Size) {
+        guard var stream = streams[windowUID] else { return }
+        guard stream.contentSizePx != size else { return }
+        stream.contentSizePx = size
+        streams[windowUID] = stream
+        bus.send(stream, type: .streamInfo)
+    }
+
     /// 强制重发编辑上下文（响应 Viewer 的请求，或焦点变化时）。
     public func forcePublishTextContext() {
         lastPublishedEditVersion = .max

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import M2MCore
 
 // m2mhost —— 远端主机代理（独立进程）
@@ -22,6 +23,8 @@ struct HostOptions {
     var bitrateMbps: Double = 8
     var useReal = false
     var targetPID: Int32?
+    var targetBundle: String?
+    var realCapture = false
     var windowSize = Size(560, 380)
 }
 
@@ -38,6 +41,8 @@ func parseHostOptions() -> HostOptions {
         case "--bitrate": o.bitrateMbps = Double(it.next() ?? "8") ?? 8
         case "--real": o.useReal = true
         case "--pid": o.targetPID = Int32(it.next() ?? "")
+        case "--target-bundle": o.targetBundle = it.next()
+        case "--real-capture": o.realCapture = true
         case "--size":
             if let s = it.next() {
                 let p = s.split(separator: "x").compactMap { Double($0) }
@@ -51,8 +56,10 @@ func parseHostOptions() -> HostOptions {
 
               --relay <path>        中继套接字（必填）
               --demo-socket <path>  连接目标应用进程（推荐，无需系统权限）
-              --real                改用 ScreenCaptureKit + AX + CGEvent（需权限）
-              --pid <pid>           --real 模式下的目标进程
+              --real-capture        使用真实屏幕采集（ScreenCaptureKit，仅需屏幕录制权限）
+              --real                真实采集 + AX/CGEvent 输入与文本路径（还需辅助功能权限）
+              --pid <pid>           目标进程 PID
+              --target-bundle <id>  目标应用 bundle id（用于定位进程）
               --fps <n>             目标帧率（默认 30）
               --bitrate <mbps>      目标码率（默认 8）
               --size WxH            内置 demo 窗口尺寸
@@ -86,6 +93,8 @@ var hostTextProvider: TextContextProvider?
 /// 提交执行器（必须有：缺了它会出现"能看到上下文但提交永远失败"的静默降级）
 var hostCommitExecutor: TextCommitExecutor?
 var hostDemoProxy: DemoAppProxy?
+/// 真实采集的窗口提供者（需要它来把窗口映射为可采集的 SCWindow）
+var hostRealCaptureProvider: SCKWindowProvider?
 
 let runRoot = hostOptions.runDir.map { URL(fileURLWithPath: $0) }
     ?? FileManager.default.temporaryDirectory.appendingPathComponent("m2m-host-\(UUID().uuidString.prefix(8))")
@@ -93,7 +102,48 @@ try? FileManager.default.createDirectory(at: runRoot, withIntermediateDirectorie
 let receivedDir = runRoot.appendingPathComponent("received")
 try? FileManager.default.createDirectory(at: receivedDir, withIntermediateDirectories: true)
 
-if let demoSocket = hostOptions.demoSocket, !demoSocket.isEmpty,
+/// 解析真实模式下的目标进程：优先 --pid，其次 --target-bundle。
+func resolveTargetPID() -> pid_t? {
+    if let pid = hostOptions.targetPID { return pid }
+    guard let bundle = hostOptions.targetBundle else { return nil }
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+    return apps.first?.processIdentifier
+}
+
+if (hostOptions.realCapture || hostOptions.useReal), let pid = resolveTargetPID() {
+    // 真实路径：屏幕录制权限足以枚举与采集窗口；辅助功能权限额外解锁
+    // 尺寸修改、输入注入与插入点读取。缺哪一项就如实降级并提示，不静默伪装。
+    let sck = SCKWindowProvider(targetPID: pid,
+                                bundleID: hostOptions.targetBundle ?? "unknown",
+                                displayName: NSRunningApplication(processIdentifier: pid)?
+                                    .localizedName ?? "目标应用")
+    hostWindowProvider = sck
+    hostRealCaptureProvider = sck
+
+    let axText = AXTextContextProvider(targetPID: pid)
+    let hasAX = AXIsProcessTrusted()
+    if hasAX {
+        hostTextProvider = axText
+        hostCommitExecutor = AXTextCommitExecutor(targetPID: pid)
+        hostInputSink = CGEventInputSink(targetPID: pid)
+        hostCapability.inputMode = .realEventInjection
+        hostCapability.textMode = axText.caretRectCapability
+    } else {
+        // 没有辅助功能权限：可以看画面，但不能改尺寸、注入输入、读插入点
+        hostTextProvider = nil
+        hostCommitExecutor = nil
+        hostInputSink = CGEventInputSink(targetPID: pid)   // 内部 available=false
+        hostCapability.inputMode = .unavailable
+        hostCapability.textMode = .unavailable
+    }
+    hostCapability.screenRecording = SystemCapabilityProbe.screenRecordingState()
+    hostCapability.accessibility = hasAX ? .granted : .denied
+    hostCapability.captureMode = sck.available ? .realWindowCapture : .unavailable
+    logHost("真实路径：目标 pid=\(pid) 屏幕录制=\(hostCapability.screenRecording.localizedDescription) 辅助功能=\(hostCapability.accessibility.localizedDescription)")
+    if !hasAX {
+        logHost("提示：缺少辅助功能权限 → 画面为真实采集，但改尺寸/输入注入/插入点读取不可用（已按降级上报）")
+    }
+} else if let demoSocket = hostOptions.demoSocket, !demoSocket.isEmpty,
    let connection = try? IPCClient.connectWithRetry(to: demoSocket, timeout: 5) {
     let proxy = DemoAppProxy(connection: connection)
     hostDemoProxy = proxy
@@ -140,11 +190,38 @@ if let demoSocket = hostOptions.demoSocket, !demoSocket.isEmpty,
 // MARK: 采集源
 
 var captureSources: [String: CaptureSource] = [:]
+/// 真实采集启动失败的原因（进报告，不静默）
+var hostCaptureFailures: [String] = []
 
 func ensureCaptureSources() {
     let wins = hostWindowProvider.currentWindows()
     for w in wins where w.role.requiresLocalShell {
         let streamID = "stream:\(w.windowUID)"
+        // 真实采集：优先用 ScreenCaptureKit；失败时回落到合成源并记录原因
+        if let real = hostRealCaptureProvider, hostCapability.captureMode == .realWindowCapture {
+            if captureSources[w.windowUID] == nil {
+                let r = RealCaptureFactory.makeSource(provider: real, uid: w.windowUID, streamID: streamID)
+                if let source = r.source {
+                    if let sckSource = source as? SCKWindowCaptureSource {
+                        // 启动错误必须可见：静默失败会让"真实采集已启用"变成一句空话
+                        sckSource.start { error in
+                            if let error {
+                                hostCaptureFailures.append("\(w.title) 采集启动失败：\(error.localizedDescription)")
+                                logHost("真实采集启动失败：\(w.title) → \(error.localizedDescription)")
+                            } else {
+                                logHost("真实采集流已启动：\(w.title)")
+                            }
+                        }
+                    }
+                    captureSources[w.windowUID] = source
+                    logHost("真实采集已登记：\(w.title)（框 \(Int(w.contentSize.width))x\(Int(w.contentSize.height))）")
+                } else {
+                    hostCaptureFailures.append("\(w.title)：\(r.reason ?? "未知原因")")
+                    logHost("真实采集启动失败：\(w.title) → \(r.reason ?? "未知原因")（已回落合成源）")
+                }
+            }
+            if captureSources[w.windowUID] != nil { continue }
+        }
         let content: SyntheticWindowContent
         if let snap = hostDemoProxy?.cachedTextState {
             content = SyntheticWindowContent(title: w.title, textContent: snap.buffer,
@@ -237,6 +314,14 @@ func writeHostState() {
         },
         "notices": hostRuntime.notices.map(jsonSafe),
         "received_files": hostFileBridge.completedNames,
+        "capture_failures": hostCaptureFailures,
+        "real_capture_windows": captureSources.compactMap { (uid, src) -> String? in
+            (src as? SCKWindowCaptureSource) != nil ? uid : nil
+        },
+        "real_capture_frames": captureSources.compactMap { (uid, src) -> String? in
+            guard let sck = src as? SCKWindowCaptureSource else { return nil }
+            return "\(uid):\(sck.diagnosticsSummary)"
+        },
         "text_buffer": snap?.text.buffer
             ?? hostDemoProxy?.cachedTextState?.buffer ?? "",
         "text_caret": snap?.text.caret ?? hostDemoProxy?.cachedTextState?.caret ?? 0,
@@ -267,6 +352,18 @@ hostTimer.setEventHandler {
     // 刷新目标应用快照（本地 UDS 往返，微秒级；在会话队列上执行，不会与读取队列互相等待）
     hostDemoProxy?.refresh()
     ensureCaptureSources()
+    // 采集到的像素尺寸作为**流信息**的事实来源（编码像素量、几何映射用），
+    // 但不回写到窗口的逻辑尺寸：逻辑尺寸由窗口提供者负责，两边互相覆盖会让
+    // layoutVersion 每帧都变，接收端会把所有帧判为过期。
+    if hostCapability.captureMode == .realWindowCapture {
+        for (uid, src) in captureSources {
+            guard let sck = src as? SCKWindowCaptureSource else { continue }
+            if let px = sck.lastCapturedSize, px != hostRuntime.streams[uid]?.contentSizePx {
+                hostRuntime.noteCapturePixelSize(windowUID: uid, size: px)
+                logHost("采集像素尺寸：\(uid) → \(Int(px.width))x\(Int(px.height))")
+            }
+        }
+    }
     hostRuntime.tick(now: now)
     if hostTicks % 20 == 0 { writeHostState() }
 }

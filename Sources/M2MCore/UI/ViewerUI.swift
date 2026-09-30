@@ -2,14 +2,17 @@ import Foundation
 import AppKit
 import M2MCore
 
-// m2mviewer 的 AppKit 界面层。
+// 本地客户端的 AppKit 界面层。
 //
 // 这里承载"像原生 App 一样操作远端窗口"的全部本地交互：
 //   · 窗口外壳由本地窗口系统管理（移动/缩放/最小化/与本地应用混排）
 //   · 中文输入法在本地组合，候选窗跟随远端插入点
 //   · 快捷键与输入法路径严格分开
+//
+// 放在 M2MCore 而不是 CLI 目标里，是为了让按键路径决策与 doCommand 映射
+// 能被直接用真实 NSEvent 断言。
 
-final class ViewerWindowController: NSObject, NSApplicationDelegate {
+public final class ViewerWindowController: NSObject, NSApplicationDelegate {
     private let runtime: ViewerRuntime
     private let queue: DispatchQueue
     private var windows: [String: NSWindow] = [:]
@@ -19,28 +22,32 @@ final class ViewerWindowController: NSObject, NSApplicationDelegate {
     private var lastNoticeCount = -1
     private var hasConnected = false
 
-    init(runtime: ViewerRuntime, queue: DispatchQueue) {
+    public init(runtime: ViewerRuntime, queue: DispatchQueue) {
         self.runtime = runtime
         self.queue = queue
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    /// 日志与状态落盘由 CLI 注入，避免库层依赖具体进程形态。
+    public var logHandler: ((String) -> Void)?
+    public var stateWriter: (() -> Void)?
+
+    public func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
         buildHUD()
         // 连接：握手后窗口状态会陆续到达
         queue.async { [runtime] in
             runtime.sendHello()
-            logViewer("已发送握手")
+            self.logHandler?("已发送握手")
         }
         if runtime.windowTable.count == 0 {
             showPlaceholder()
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        writeViewerState()
+    public func applicationWillTerminate(_ notification: Notification) {
+        stateWriter?()
     }
 
     // MARK: HUD（能力与提示）
@@ -106,7 +113,7 @@ final class ViewerWindowController: NSObject, NSApplicationDelegate {
 
     // MARK: 窗口同步
 
-    func syncWindows() {
+    public func syncWindows() {
         if runtime.windowTable.count > 0, let p = placeholder {
             p.close(); placeholder = nil
         }
@@ -146,7 +153,7 @@ final class ViewerWindowController: NSObject, NSApplicationDelegate {
                 windows[shell.windowUID] = window
                 contentViews[shell.windowUID] = view
                 view.update(shell: shell, decoded: decoded, runtime: runtime)
-                logViewer("创建本地窗口壳 \(shell.windowUID) 「\(shell.title)」\(shell.role.localizedDescription)")
+                logHandler?("创建本地窗口壳 \(shell.windowUID) 「\(shell.title)」\(shell.role.localizedDescription)")
             }
         }
 
@@ -154,7 +161,7 @@ final class ViewerWindowController: NSObject, NSApplicationDelegate {
             window.close()
             windows.removeValue(forKey: uid)
             contentViews.removeValue(forKey: uid)
-            logViewer("关闭本地窗口壳 \(uid)（远端窗口已消失）")
+            logHandler?("关闭本地窗口壳 \(uid)（远端窗口已消失）")
         }
 
         updateHUD()
@@ -162,7 +169,7 @@ final class ViewerWindowController: NSObject, NSApplicationDelegate {
 }
 
 /// 承载远端窗口画面的本地视图，同时是本地输入法的输入客户端。
-final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
+public final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
     private let runtime: ViewerRuntime
     private let queue: DispatchQueue
     private let windowUID: String
@@ -175,7 +182,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
     private var resizeStart: NSSize = .zero
     private var pendingComposition: String = ""
 
-    init(runtime: ViewerRuntime, queue: DispatchQueue, windowUID: String) {
+    public init(runtime: ViewerRuntime, queue: DispatchQueue, windowUID: String) {
         self.runtime = runtime
         self.queue = queue
         self.windowUID = windowUID
@@ -184,15 +191,15 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         layer?.backgroundColor = NSColor.black.cgColor
     }
 
-    required init?(coder: NSCoder) { fatalError() }
+    public required init?(coder: NSCoder) { fatalError() }
 
-    override var acceptsFirstResponder: Bool { true }
-    override func becomeFirstResponder() -> Bool { true }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    public override var acceptsFirstResponder: Bool { true }
+    public override func becomeFirstResponder() -> Bool { true }
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     // MARK: 渲染
 
-    func update(shell: RemoteWindowTable.Shell, decoded: DecodedFrame?, runtime: ViewerRuntime) {
+    public func update(shell: RemoteWindowTable.Shell, decoded: DecodedFrame?, runtime: ViewerRuntime) {
         lastShell = shell
         if let decoded, decoded.pixelChecksum != latestDecoded?.pixelChecksum {
             latestDecoded = decoded
@@ -212,7 +219,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    public override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         ctx.setFillColor(NSColor.black.cgColor)
         ctx.fill(bounds)
@@ -239,20 +246,20 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
 
     // MARK: 输入法（NSTextInputClient）
 
-    func hasMarkedText() -> Bool { !markedText.string.isEmpty }
+    public func hasMarkedText() -> Bool { !markedText.string.isEmpty }
 
-    func markedRange() -> NSRange {
+    public func markedRange() -> NSRange {
         markedText.string.isEmpty ? NSRange(location: NSNotFound, length: 0)
             : NSRange(location: 0, length: markedText.string.count)
     }
 
-    func selectedRange() -> NSRange {
+    public func selectedRange() -> NSRange {
         let ctx = runtime.textBridge.context
         guard let ctx, ctx.selection.valid else { return NSRange(location: 0, length: 0) }
         return NSRange(location: ctx.selection.location, length: ctx.selection.length)
     }
 
-    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+    public func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         let text: String
         if let s = string as? String { text = s }
         else if let s = string as? NSAttributedString { text = s.string }
@@ -269,14 +276,14 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         needsDisplay = true
     }
 
-    func unmarkText() {
+    public func unmarkText() {
         markedText = NSMutableAttributedString()
         queue.async { [runtime] in runtime.textBridge.cancelComposition() }
         needsDisplay = true
     }
 
     /// 输入法确认文字 → 走文本提交通道（绝不走按键通道）
-    func insertText(_ string: Any, replacementRange: NSRange) {
+    public func insertText(_ string: Any, replacementRange: NSRange) {
         let text: String
         if let s = string as? String { text = s }
         else if let s = string as? NSAttributedString { text = s.string }
@@ -294,7 +301,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         needsDisplay = true
     }
 
-    override func doCommand(by selector: Selector) {
+    public override func doCommand(by selector: Selector) {
         // 输入法未消费该按键 → 作为应用操作发往远端
         queue.async { [runtime] in
             let keycode = Self.keycode(for: selector)
@@ -306,7 +313,8 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    private static func keycode(for selector: Selector) -> UInt16 {
+    /// 输入法未消费的按键会经此映射为远端按键。抽成静态方法以便直接断言映射表。
+    public static func keycode(for selector: Selector) -> UInt16 {
         switch NSStringFromSelector(selector) {
         case "insertNewline:", "insertNewlineIgnoringFieldEditor:": return KeyCode.returnKey
         case "insertTab:": return KeyCode.tab
@@ -326,7 +334,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
     }
 
     /// 候选窗位置：由远端插入点映射而来（**不是**鼠标最后点击位置）
-    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+    public func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
         actualRange?.pointee = range
         let ctx = runtime.textBridge.context
         guard let ctx, ctx.caret.valid, let shell = lastShell, let window else {
@@ -349,29 +357,43 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         return window.convertToScreen(convert(viewRect, to: nil))
     }
 
-    func characterIndex(for point: NSPoint) -> Int { 0 }
-    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? { nil }
-    func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+    public func characterIndex(for point: NSPoint) -> Int { 0 }
+    public func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? { nil }
+    public func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
 
     // MARK: 键盘与鼠标
 
-    override func keyDown(with event: NSEvent) {
+    /// 按键去向决策。抽成独立方法以便在测试中直接用真实 NSEvent 断言——
+    /// 这是"选词的 Enter 不会变成发送"在 AppKit 这一层的落点。
+    ///
+    /// 返回 true 表示按键应作为快捷键直接发往远端；false 表示必须先交给本地输入法。
+    public func keyPath(for event: NSEvent) -> KeyHandlingPath {
+        IMEKeyDecision.path(keycode: event.keyCode,
+                            flags: ModifierFlags(rawValue: UInt32(event.modifierFlags.rawValue)),
+                            isComposing: runtime.textBridge.state.isComposing)
+    }
+
+    public override func keyDown(with event: NSEvent) {
         let flags = ModifierFlags(rawValue: UInt32(event.modifierFlags.rawValue))
-        // 组合期间的按键必须由本地输入法优先处理
         let composing = runtime.textBridge.state.isComposing
-        if composing || !flags.hasCommandLikeModifier {
-            // 交给输入法解释：它要么产生组合文本，要么回调 doCommand(by:)
+        switch keyPath(for: event) {
+        case .shortcutToRemote:
+            sendShortcut(event)
+        case .interpretByIME:
+            // 交给输入法解释：它要么产生组合文本（insertText），要么回调 doCommand(by:)
             interpretKeyEvents([event])
-            // 方向/编辑键会走 doCommand；普通字符产生组合文本
+            // 方向/编辑键通常由 doCommand 兜住；这里再保一层，
+            // 保证非组合态的方向键确实发出去（两个路径都发会重复，因此只在未走 doCommand 时补发）
             if markedText.string.isEmpty, !composing, isNavigationKey(event.keyCode) {
                 sendNavigation(event)
             }
-            return
+        case .imeOnly:
+            // 组合期间只允许本地输入法处理，即使它不消费也不外发
+            interpretKeyEvents([event])
         }
-        sendShortcut(event)
     }
 
-    override func keyUp(with event: NSEvent) {
+    public override func keyUp(with event: NSEvent) {
         let flags = ModifierFlags(rawValue: UInt32(event.modifierFlags.rawValue))
         guard flags.hasCommandLikeModifier else { return }
         queue.async { [runtime] in
@@ -380,7 +402,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    override func flagsChanged(with event: NSEvent) {
+    public override func flagsChanged(with event: NSEvent) {
         let flags = ModifierFlags(rawValue: UInt32(event.modifierFlags.rawValue))
         queue.async { [runtime] in
             _ = runtime.routeAndSendKey(keycode: event.keyCode, kind: .flagsChanged, flags: flags,
@@ -412,7 +434,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    override func mouseDown(with event: NSEvent) {
+    public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let p = convert(event.locationInWindow, from: nil)
         let point = remotePoint(p)
@@ -426,7 +448,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    override func mouseDragged(with event: NSEvent) {
+    public override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let point = remotePoint(p)
         queue.async { [runtime] in
@@ -435,7 +457,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    override func scrollWheel(with event: NSEvent) {
+    public override func scrollWheel(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let point = remotePoint(p)
         queue.async { [runtime] in
@@ -458,7 +480,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
 
     // MARK: 缩放
 
-    func windowWillStartLiveResize(_ notification: Notification) {
+    public func windowWillStartLiveResize(_ notification: Notification) {
         resizing = true
         resizeStart = bounds.size
         if let shell = lastShell {
@@ -468,7 +490,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    func windowDidResize(_ notification: Notification) {
+    public func windowDidResize(_ notification: Notification) {
         guard resizing, let shell = lastShell, let window else { return }
         // 拖动中：本地立即改变外框，远端请求按频率合并发送
         queue.async { [runtime] in
@@ -478,7 +500,7 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         }
     }
 
-    func windowDidEndLiveResize(_ notification: Notification) {
+    public func windowDidEndLiveResize(_ notification: Notification) {
         resizing = false
         guard let shell = lastShell, let window else { return }
         let size = Size(Double(window.contentView?.bounds.width ?? 0),
@@ -487,3 +509,15 @@ final class RemoteWindowView: NSView, NSTextInputClient, NSWindowDelegate {
         queue.async { [runtime] in runtime.endResize(windowUID: shell.windowUID, finalSize: size) }
     }
 }
+
+/// GUI 与运行时的桥：无 GUI 模式下为空实现，保证两条路径共用同一套逻辑。
+public final class ViewerUIBridge {
+    public static let shared = ViewerUIBridge()
+    public var lastCaretLocalRect: Rect?
+    public var onWindowsChanged: (() -> Void)?
+    public var onFramesReady: (() -> Void)?
+    public func refreshWindows() { onWindowsChanged?() }
+    public func refreshFrames() { onFramesReady?() }
+    public func showNotice(_ notice: Notice) {}
+}
+

@@ -31,6 +31,10 @@ jobs:
           .build/debug/m2mctl scenarios
           .build/debug/m2mctl selftest --report docs/reports/automated-test-report.md
 
+      # 性能基线。单机注入链路条件，本地交互项必须与网络无关。
+      - name: Performance baseline
+        run: .build/debug/m2mctl perf --report docs/reports/performance-baseline.md
+
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4

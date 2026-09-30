@@ -170,10 +170,12 @@ func advancePendingInput(now: TimeInterval) {
     switch input.phase {
     case .awaitingContext:
         guard let ctx = viewerRuntime.textBridge.context else { return }
-        if !viewerRuntime.textBridge.state.isComposing {
-            viewerRuntime.textBridge.beginComposition(editVersion: ctx.editVersion)
+        viewerRuntime.measureCompositionUpdate {
+            if !viewerRuntime.textBridge.state.isComposing {
+                viewerRuntime.textBridge.beginComposition(editVersion: ctx.editVersion)
+            }
+            viewerRuntime.textBridge.updateComposition(input.text)
         }
-        viewerRuntime.textBridge.updateComposition(input.text)
         input.phase = .readyToCommit
         pendingInput = input
     case .readyToCommit:
@@ -230,22 +232,24 @@ func writeViewerState() {
         info["caret_local_rect"] = ["x": coord.origin.x, "y": coord.origin.y,
                                     "w": coord.size.width, "h": coord.size.height]
     }
+    if let sig = viewerRuntime.lastFrameSignature {
+        info["frame_signature"] = [
+            "width": sig.width, "height": sig.height,
+            "distinct_colors": sig.distinctColors,
+            "average_luma": sig.averageLuma,
+            "looks_like_real_screen": sig.looksLikeRealScreenContent,
+            "checksum": String(sig.checksum),
+        ]
+    }
+    info["latency"] = viewerRuntime.metrics.asJSON
+    let budget = viewerRuntime.metrics.localInteractionWithinBudget()
+    info["local_interaction_ok"] = budget.ok
+    info["local_interaction_detail"] = budget.detail
     info["caret_valid"] = viewerRuntime.textBridge.context?.caret.valid ?? false
     info["composition"] = viewerRuntime.textBridge.state.isComposing
     if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
         try? data.write(to: viewerStateURL, options: .atomic)
     }
-}
-
-/// GUI 与运行时的桥：无 GUI 模式下为空实现，保证两条路径共用同一套逻辑。
-final class ViewerUIBridge {
-    static let shared = ViewerUIBridge()
-    var lastCaretLocalRect: Rect?
-    var onWindowsChanged: (() -> Void)?
-    var onFramesReady: (() -> Void)?
-    func refreshWindows() { onWindowsChanged?() }
-    func refreshFrames() { onFramesReady?() }
-    func showNotice(_ notice: Notice) {}
 }
 
 logViewer("已连接中继 socket=\(viewerOptions.relaySocket)")
@@ -285,6 +289,8 @@ if viewerOptions.headless {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     let controller = ViewerWindowController(runtime: viewerRuntime, queue: viewerQueue)
+    controller.logHandler = { logViewer($0) }
+    controller.stateWriter = { writeViewerState() }
     ViewerUIBridge.shared.onWindowsChanged = { [weak controller] in
         DispatchQueue.main.async { controller?.syncWindows() }
     }

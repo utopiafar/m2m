@@ -15,6 +15,10 @@ public final class ViewerRuntime {
     public let fileBridge: FileBridge
     public let clipboard = ClipboardBridge()
     public let resizeCoalescer: ResizeCoalescer
+    /// 运行时延迟指标（G3）。本地交互项必须与网络无关，端到端项随链路变化。
+    public let metrics = LatencyMetrics()
+    private var commitSentAt: TimeInterval?
+    private var resizeSentAt: [UInt32: TimeInterval] = [:]
 
     public private(set) var hostCapabilities: Capabilities?
     public private(set) var streams: [String: StreamInfo] = [:]
@@ -32,6 +36,8 @@ public final class ViewerRuntime {
     public var notices: [Notice] { session.notices + localNotices }
     public private(set) var lastTickTime: TimeInterval = 0
     public private(set) var commitResults: [TextCommitResult] = []
+    /// 最近一帧的像素分析签名（用于断言"画面确实来自真实采集"）
+    public private(set) var lastFrameSignature: FrameAnalysis.Signature?
     /// 本地已知的远端几何版本（来自最近一次窗口状态）
     public private(set) var layoutVersion: UInt64 = 0
     /// 是否有提交在途（超时判定由 TextBridge 负责，这里只做界面展示）。
@@ -120,6 +126,10 @@ public final class ViewerRuntime {
         bus.on([.textCommitResult]) { [weak self] env in
             guard let self, let r = self.bus.decode(env, as: TextCommitResult.self) else { return }
             self.commitResults.append(r)
+            if let sent = self.commitSentAt {
+                self.metrics.commitRoundTrip.record(Date().timeIntervalSinceReferenceDate - sent)
+                self.commitSentAt = nil
+            }
             self.textBridge.receive(result: r)
         }
         bus.on([.fileProgress]) { [weak self] env in
@@ -195,6 +205,9 @@ public final class ViewerRuntime {
     }
 
     private func handleResizeResult(_ r: WindowResizeResult) {
+        if let sent = resizeSentAt.removeValue(forKey: r.requestSeq) {
+            metrics.resizeRoundTrip.record(Date().timeIntervalSinceReferenceDate - sent)
+        }
         // 只接受最新请求的结果：过期结果不得回退本地窗口尺寸
         guard resizeCoalescer.isNewest(seq: r.requestSeq) else {
             return
@@ -224,6 +237,12 @@ public final class ViewerRuntime {
             if let decoded = try receiver.ingest(frame, decoder: decoder, currentLayoutVersion: layoutVersion) {
                 decodedFrames[windowUID] = decoded
                 framesReceived += 1
+                lastFrameSignature = FrameAnalysis.analyze(decoded)
+                // 发送时刻由主机打点；单机验证中两端共享同一时钟，可直接算端到端延迟
+                if wire.sentAt > 0 {
+                    let now = Date().timeIntervalSinceReferenceDate
+                    metrics.frameLatency.record(now - wire.sentAt)
+                }
             } else {
                 framesDroppedStale += 1
             }
@@ -254,8 +273,12 @@ public final class ViewerRuntime {
     // MARK: 窗口操作
 
     public func beginResize(windowUID: String, requested: Size) {
-        windowTable.beginLiveResize(uid: windowUID, localSize: requested)
+        // 本地尺寸立即生效：这一段必须与网络无关，因此单独计时
+        metrics.localResizeApply.measure {
+            windowTable.beginLiveResize(uid: windowUID, localSize: requested)
+        }
         if let req = resizeCoalescer.submit(uid: windowUID, size: requested, now: lastTickTime) {
+            resizeSentAt[req.seq] = Date().timeIntervalSinceReferenceDate
             bus.send(WindowResizeRequest(epoch: session.epoch, windowUID: windowUID,
                                          requestedContentSize: req.size, requestSeq: req.seq),
                      type: .windowResizeRequest)
@@ -264,6 +287,7 @@ public final class ViewerRuntime {
 
     public func endResize(windowUID: String, finalSize: Size) {
         let flushed = resizeCoalescer.flush(uid: windowUID, size: finalSize)
+        resizeSentAt[flushed.seq] = Date().timeIntervalSinceReferenceDate
         bus.send(WindowResizeRequest(epoch: session.epoch, windowUID: windowUID,
                                      requestedContentSize: flushed.size, requestSeq: flushed.seq),
                  type: .windowResizeRequest)
@@ -299,11 +323,17 @@ public final class ViewerRuntime {
         return flushOutgoingCommits(at: now)
     }
 
+    /// 记录一次本地组合更新耗时（**必须与网络无关**）。
+    public func measureCompositionUpdate<T>(_ body: () -> T) -> T {
+        metrics.localCompositionUpdate.measure(body)
+    }
+
     /// 把文本桥产生的提交发出去。返回本次发送的条数。
     @discardableResult
     public func flushOutgoingCommits(at now: TimeInterval) -> Int {
         let commits = textBridge.takeOutgoingCommits()
         for commit in commits {
+            commitSentAt = Date().timeIntervalSinceReferenceDate
             bus.send(commit, type: .textCommit)
         }
         return commits.count
