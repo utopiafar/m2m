@@ -652,11 +652,36 @@ func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [Scenar
                 detail = "未收到任何画面帧的像素分析"
                 break
             }
+            let width = (sig["width"] as? Int) ?? 0
+            let height = (sig["height"] as? Int) ?? 0
+            let checksum = (sig["checksum"] as? String) ?? ""
             let colors = (sig["distinct_colors"] as? Int) ?? 0
             let luma = (sig["average_luma"] as? Double) ?? 0
-            let looksReal = (sig["looks_like_real_screen"] as? Bool) ?? false
-            passed = looksReal && colors >= 64
-            detail = "彩色种类 \(colors)（真实屏幕截图通常几百以上；合成渲染仅十余种），平均亮度 \(String(format: "%.1f", luma))，判定为真实屏幕=\(looksReal)"
+
+            // 判据必须与环境无关：CI runner 的桌面是纯色背景，用"颜色种类"设阈值会在
+            // 那里误判。改用**与合成渲染做对照**——真实采集的像素不可能等于我们自己的
+            // 渲染器在同一尺寸下产出的位图（真实画面还包含窗口装饰、缩放与桌面背景）。
+            let size = Size(Double(width), Double(height))
+            func checksumOf(render content: SyntheticWindowContent) -> String {
+                let px = SyntheticRenderer.render(content, size: size)
+                var h: UInt64 = 0xcbf29ce484222325
+                for b in px { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+                return String(h)
+            }
+            let syntheticEmpty = checksumOf(render: SyntheticWindowContent())
+            let syntheticTitled = checksumOf(render: SyntheticWindowContent(title: "M2M Demo App"))
+
+            let plausibleSize = width >= 64 && height >= 64
+            let differsFromSynthetic = !checksum.isEmpty
+                && checksum != syntheticEmpty && checksum != syntheticTitled
+            // 纯合成渲染（空窗口）只有两三种颜色；这里给一个很宽的下限，
+            // 主要用来排除"全黑/全白"的异常帧。
+            let hasSomeVariation = colors >= 4
+
+            passed = plausibleSize && differsFromSynthetic && hasSomeVariation
+            detail = "帧尺寸 \(width)x\(height)（要求 ≥64x64：\(plausibleSize)）；"
+                + "像素与合成渲染不同：\(differsFromSynthetic)；"
+                + "颜色种类 \(colors)、平均亮度 \(String(format: "%.1f", luma))"
 
         case .expectDegraded(let degraded):
             Thread.sleep(forTimeInterval: 1.0)
