@@ -145,6 +145,10 @@ struct Scenario {
         case requiresDisplayAndScreenRecording
         /// 需要目标应用处于前台（Chromium 的焦点控件读取依赖此条件）
         case requiresTargetAppFrontmost
+        /// 需要本机已安装 Electron 运行时
+        case requiresElectronRuntime
+        /// 需要 GUI 会话 + 屏幕录制权限 + Electron 运行时
+        case requiresDisplayAndScreenRecordingAndElectron
     }
 }
 
@@ -312,7 +316,7 @@ let scenarioTable: [Scenario] = [
             // 不同应用的窗口尺寸不同，硬编码会让断言变成"记答案"
             Step(description: "窗口尺寸与目标应用声明一致（Chromium 启用无障碍树后应可读）", action: .expectRealWindowSizeMatchesApp),
         ],
-        visibility: .requiresDisplayAndScreenRecording,
+        visibility: .requiresDisplayAndScreenRecordingAndElectron,
         usesRealCapture: true,
         usesRealAXPath: true,
         usesElectronApp: true),
@@ -352,7 +356,7 @@ let scenarioTable: [Scenario] = [
             Step(description: "远端窗口应比初始更多", action: .expectMoreWindowsThan(1)),
             Step(description: "本地壳数量与远端窗口一致", action: .expectLocalMatchesRemote),
         ],
-        visibility: .requiresDisplayAndScreenRecording,
+        visibility: .requiresDisplayAndScreenRecordingAndElectron,
         usesRealCapture: true,
         usesRealAXPath: true,
         usesElectronApp: true),
@@ -464,25 +468,11 @@ final class Orchestrator {
     ///   2. 仓库内 TestApps/electron-demo 的本地安装
     /// 找不到时场景标记为跳过（跳过 ≠ 通过），并给出安装提示。
     func startElectronDemo(extraArgs: [String]) throws -> Int32 {
-        let env2 = ProcessInfo.processInfo.environment
-        var binary = env2["M2M_ELECTRON_BIN"]
-        var appDir = env2["M2M_ELECTRON_APP"]
-        if binary == nil || appDir == nil {
-            let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            let local = cwd.appendingPathComponent("TestApps/electron-demo")
-            let candidates = [
-                local.appendingPathComponent("node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"),
-                local.appendingPathComponent("node_modules/.bin/electron"),
-            ]
-            for c in candidates where FileManager.default.isExecutableFile(atPath: c.path) {
-                binary = c.path; break
-            }
-            if FileManager.default.fileExists(atPath: local.appendingPathComponent("main.js").path) {
-                appDir = local.path
-            }
-        }
         electronDemoWasUsed = true
-        guard let bin = binary, let app = appDir else {
+        let runtime = resolveElectronRuntime()
+        let bin = runtime?.binary
+        let app = runtime?.app
+        guard let bin, let app else {
             throw NSError(domain: "m2mctl", code: 3, userInfo: [
                 NSLocalizedDescriptionKey:
                     "找不到 Electron（需要 M2M_ELECTRON_BIN / M2M_ELECTRON_APP，或在 TestApps/electron-demo 安装依赖）"])
@@ -708,6 +698,38 @@ func findDuplicatedSubstrings(_ s: String) -> [String] {
 
 // MARK: - 场景执行
 
+/// 解析本机的 Electron 运行时（可执行文件 + 应用目录）。
+///
+/// 抽成独立函数是为了让"前置条件检查"与"启动"用同一份判断：
+/// 只有一处逻辑，就不会出现"预检说可用、启动却失败"的不一致。
+func resolveElectronRuntime() -> (binary: String, app: String)? {
+    let env = ProcessInfo.processInfo.environment
+    var binary = env["M2M_ELECTRON_BIN"]
+    var appDir = env["M2M_ELECTRON_APP"]
+    // 环境变量必须**有效**才算命中：只判非空会让一个错误的路径
+    // 通过预检、随后在启动阶段失败——那正是"预检说可用、启动却失败"的不一致
+    if let b = binary, let a = appDir,
+       FileManager.default.isExecutableFile(atPath: b),
+       FileManager.default.fileExists(atPath: a) {
+        return (b, a)
+    }
+    binary = nil; appDir = nil
+    if binary == nil || appDir == nil {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let local = cwd.appendingPathComponent("TestApps/electron-demo")
+        for c in [local.appendingPathComponent("node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"),
+                  local.appendingPathComponent("node_modules/.bin/electron")]
+        where FileManager.default.isExecutableFile(atPath: c.path) {
+            binary = c.path; break
+        }
+        if FileManager.default.fileExists(atPath: local.appendingPathComponent("main.js").path) {
+            appDir = local.path
+        }
+    }
+    guard let b = binary, let a = appDir else { return nil }
+    return (b, a)
+}
+
 /// 前置条件检查。不满足时返回原因（场景标记为跳过，**不是通过**）。
 func preflightFailure(_ s: Scenario) -> String? {
     switch s.visibility {
@@ -720,6 +742,19 @@ func preflightFailure(_ s: Scenario) -> String? {
         // 无 GUI 会话时 SCK 也枚举不到窗口
         if NSScreen.main == nil {
             return "当前无图形会话（无显示器/未登录）"
+        }
+        return nil
+    case .requiresDisplayAndScreenRecordingAndElectron:
+        if let r = preflightFailure(Scenario(name: "x", summary: "", expectation: "",
+                                             visibility: .requiresDisplayAndScreenRecording)) {
+            return r
+        }
+        return preflightFailure(Scenario(name: "x", summary: "", expectation: "",
+                                         visibility: .requiresElectronRuntime))
+    case .requiresElectronRuntime:
+        if resolveElectronRuntime() == nil {
+            return "本机未安装 Electron 运行时（TestApps/electron-demo 未安装依赖，"
+                + "或未设置 M2M_ELECTRON_BIN / M2M_ELECTRON_APP）"
         }
         return nil
     case .requiresTargetAppFrontmost:
@@ -736,10 +771,16 @@ func preflightFailure(_ s: Scenario) -> String? {
     }
 }
 
+/// 被前置条件跳过的场景名。跳过**不算失败**——环境不具备（无 Electron、
+/// 无权限、无图形会话）不该让 CI 变红；但跳过也**绝不等于通过**，报告中单独列出。
+nonisolated(unsafe) var skippedScenarios = Set<String>()
+
 func runScenario(_ s: Scenario, options: CLIOptions, into results: inout [ScenarioResult]) throws {
     if let reason = preflightFailure(s) {
         out("")
         out("⏭ 场景 \(s.name)：前置条件不满足（\(reason)）→ 跳过，不计入通过")
+        // 跳过既不算通过也不算失败：但单场景运行时也要让调用方看得见
+        skippedScenarios.insert(s.name)
         return
     }
     let env = try RunEnvironment.create(label: s.name)
@@ -1504,6 +1545,10 @@ case "run":
         exit(1)
     }
     out("")
+    if skippedScenarios.contains(s.name) {
+        out("结论：跳过（前置条件不满足，不计入通过）")
+        exit(0)
+    }
     let ok = results.first?.passed ?? false
     out(ok ? "结论：通过" : "结论：未通过")
     exit(ok ? 0 : 1)
@@ -1540,8 +1585,12 @@ case "selftest":
         errOut("写入报告失败：\(error.localizedDescription)")
     }
     let passedCount = results.filter { $0.passed }.count
-    out("场景通过：\(passedCount)/\(scenarioTable.count)")
-    exit(failures == 0 && passedCount == scenarioTable.count ? 0 : 1)
+    let skipped = scenarioTable.count - results.count - failures
+    out("场景通过：\(passedCount)/\(scenarioTable.count)"
+        + (skipped > 0 ? "（跳过 \(skipped)：前置条件不满足）" : ""))
+    // 跳过不算失败：环境不具备（无 Electron、无权限、无图形会话）不该让 CI 变红，
+    // 但"跳过"也绝不等于"通过"——报告中单独列出。
+    exit(failures == 0 && passedCount == results.count ? 0 : 1)
 
 case "ax":
     // 真实 AX 路径自检（G1-a）。直接验证项目自己的 AXTextContextProvider，
